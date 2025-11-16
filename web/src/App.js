@@ -1,12 +1,14 @@
 import React, { useRef, useEffect, useState } from "react";
-import { FilesetResolver, ImageSegmenter } from "@mediapipe/tasks-vision";
+import { FilesetResolver, ImageSegmenter, PoseLandmarker } from "@mediapipe/tasks-vision";
 
 export default function App() {
   const videoRef = useRef(null);
   const displayRef = useRef(null); // video or captured image
   const overlayRef = useRef(null);
   const segRef = useRef(null);
+  const poseRef = useRef(null);
   const capturedCanvasRef = useRef(null); // offscreen canvas of captured photo
+  const streamRef = useRef(null); // store camera stream
 
   // user input + draggable lines
   const [heightCm, setHeightCm] = useState(173);
@@ -23,23 +25,44 @@ export default function App() {
 
   // segmentation model
   const [isModelReady, setIsModelReady] = useState(false); // Track model readiness
+  const [isPoseReady, setIsPoseReady] = useState(false);
   // captured still photo for calibration
   const [capturedDataUrl, setCapturedDataUrl] = useState(null);
   // countdown before photo capture
   const [countdown, setCountdown] = useState(null); // 3..2..1 or null
+  // saved front image (blob/data URL)
+  const [frontImageData, setFrontImageData] = useState(null);
+  // capture state: null = calibration, "front" = front captured, "side" = ready for side
+  const [captureState, setCaptureState] = useState(null); // null | "front" | "side"
+  // detected body features/measurements
+  const [bodyMeasurements, setBodyMeasurements] = useState(null);
 
   // ---- camera init ----
   useEffect(() => {
     (async () => {
+      try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: false,
       });
+        streamRef.current = stream; // Store stream for later use
+        if (videoRef.current) {
       videoRef.current.srcObject = stream;
       videoRef.current.onloadeddata = () => {
         videoRef.current.play().catch((err) => console.error("Video play error:", err));
       };
+        }
+      } catch (err) {
+        console.error("Camera error:", err);
+      }
     })();
+    // Cleanup on unmount
+    return () => {
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+        streamRef.current = null;
+      }
+    };
   }, []);
 
   // ---- device orientation ----
@@ -68,6 +91,17 @@ export default function App() {
         });
         segRef.current = segmenter;
         setIsModelReady(true); // Set model as ready
+        // Load pose landmarker
+        const pose = await PoseLandmarker.createFromOptions(fileset, {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
+          },
+          runningMode: "IMAGE",
+          numPoses: 1,
+        });
+        poseRef.current = pose;
+        setIsPoseReady(true);
       } catch (error) {
         console.error("Failed to load segmentation model:", error);
         alert("Failed to load segmentation model. Please check the model file.");
@@ -160,24 +194,32 @@ export default function App() {
     setScaleMmPerPx((heightCm * 10) / spanPx); // mm per pixel
   };
 
-  // ---- capture still photo for calibration ----
+  // ---- capture photo helper ----
   const capturePhoto = () => {
     const video = videoRef.current;
     if (!video || !video.videoWidth || !video.videoHeight) {
-      return alert("Camera not ready yet.");
+      alert("Camera not ready yet.");
+      return null;
     }
-    const canvas = document.createElement("canvas");
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(video, 0, 0);
-    capturedCanvasRef.current = canvas;
-    setCapturedDataUrl(canvas.toDataURL("image/jpeg", 0.9));
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(video, 0, 0);
+      capturedCanvasRef.current = canvas;
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
+      setCapturedDataUrl(dataUrl);
+      return canvas;
+    } catch (error) {
+      console.error("Error capturing photo:", error);
+      alert("Failed to capture photo: " + error.message);
+      return null;
+    }
   };
 
-  const startCountdownAndCapture = () => {
+  const startCountdownAndCapture = (onComplete) => {
     if (typeof countdown === "number") return;
-    setScaleMmPerPx(null); // reset any prior calibration when taking a new photo
     let t = 3;
     setCountdown(t);
     const interval = setInterval(() => {
@@ -186,7 +228,14 @@ export default function App() {
         clearInterval(interval);
         setCountdown(null);
         // Slight delay to allow last frame draw
-        setTimeout(() => capturePhoto(), 50);
+        setTimeout(() => {
+          const canvas = capturePhoto();
+          if (canvas && onComplete) {
+            onComplete(canvas);
+          } else if (!canvas && onComplete) {
+            console.error("Failed to capture photo, callback cancelled");
+          }
+        }, 50);
       } else {
         setCountdown(t);
       }
@@ -196,45 +245,230 @@ export default function App() {
   const retakePhoto = () => {
     capturedCanvasRef.current = null;
     setCapturedDataUrl(null);
-    setScaleMmPerPx(null);
+    if (captureState === null) {
+      setScaleMmPerPx(null); // Only reset scale if we're in initial calibration
+    }
   };
 
-  // ---- capture and segment handlers ----
-  async function captureSegment(label) {
+  // ---- auto-detect head/heel from pose landmarks ----
+  const autoDetectHeadHeel = async () => {
+    if (!isPoseReady) return alert("Pose model not ready");
+    const canvas = capturedCanvasRef.current;
+    if (!canvas) return alert("Capture a photo first.");
+    const result = await poseRef.current.detect(canvas);
+    if (!result || !result.landmarks || result.landmarks.length === 0) {
+      return alert("No pose detected. Try retaking the photo.");
+    }
+    // Use normalized landmarks of the first pose
+    const lms = result.landmarks[0];
+    const h = canvas.height;
+    // Approximate head as min y among head-adjacent points
+    // Use: nose(0), left_eye(1), right_eye(2), left_ear(7), right_ear(8)
+    const headIdx = [0, 1, 2, 7, 8];
+    let minHeadY = Infinity;
+    headIdx.forEach(i => {
+      if (lms[i]) minHeadY = Math.min(minHeadY, lms[i].y);
+    });
+    // Heels: left_heel(30), right_heel(31) in BlazePose full set
+    // If absent, fallback to ankles: left_ankle(27), right_ankle(28)
+    const heelCandidates = [30, 31, 27, 28].filter(i => lms[i]);
+    if (heelCandidates.length === 0 || !isFinite(minHeadY)) {
+      return alert("Could not find head/heels reliably. Adjust lines manually.");
+    }
+    let maxHeelY = -Infinity;
+    heelCandidates.forEach(i => {
+      maxHeelY = Math.max(maxHeelY, lms[i].y);
+    });
+    // Convert normalized y (0..1) to 0..720 logical space used by overlay lines
+    const headY720 = Math.max(0, Math.min(720, minHeadY * h * (720 / h)));
+    const heelY720 = Math.max(0, Math.min(720, maxHeelY * h * (720 / h)));
+    setHeadY(headY720);
+    setHeelY(heelY720);
+  };
+
+  // ---- capture front photo ----
+  const handleCaptureFront = () => {
+    if (typeof countdown === "number") return;
+    startCountdownAndCapture((canvas) => {
+      // After photo is captured, save it and show for line adjustment
+      const frontDataUrl = canvas.toDataURL("image/jpeg", 0.9);
+      setFrontImageData(frontDataUrl);
+      setCaptureState("front");
+      // Photo is already shown via capturedDataUrl from capturePhoto()
+    });
+  };
+
+  // ---- capture side photo and segment ----
+  const handleCaptureSide = async () => {
     if (!isModelReady) return alert("Segmentation model not ready");
-    // Use captured still if available, else grab from live video
+    if (!scaleMmPerPx) return alert("Please lock scale first");
+    
+    // If we already have a captured photo, use it; otherwise take a new one
     let canvas = capturedCanvasRef.current;
     if (!canvas) {
-      const video = videoRef.current;
-      if (!video || !video.videoWidth) {
-        return alert("No frame available.");
+      // No photo yet, start countdown and capture
+      if (typeof countdown === "number") return;
+      startCountdownAndCapture(async (capturedCanvas) => {
+        if (!capturedCanvas) {
+          console.error("Failed to capture canvas");
+          return;
+        }
+        await performSideSegmentation(capturedCanvas);
+      });
+      return;
+    }
+    
+    // Use existing captured photo
+    await performSideSegmentation(canvas);
+  };
+
+  const performSideSegmentation = async (canvas) => {
+    if (!canvas) {
+      console.error("No canvas provided for segmentation");
+      return;
+    }
+
+    // Test if canvas is valid by checking dimensions
+    if (!canvas.width || !canvas.height) {
+      console.error("Invalid canvas dimensions:", canvas.width, canvas.height);
+      return;
+    }
+
+    // Convert canvas to Image element (MediaPipe prefers Image or Video elements)
+    const img = new Image();
+    
+    await new Promise((resolve, reject) => {
+      img.onload = () => {
+        console.log("Image loaded for segmentation:", img.width, img.height);
+        resolve();
+      };
+      img.onerror = (e) => {
+        console.error("Image load error:", e);
+        reject(new Error("Failed to load image from canvas"));
+      };
+      // Use PNG for better quality
+      img.src = canvas.toDataURL("image/png");
+    });
+
+    try {
+      console.log("Starting segmentation with image:", img.width, img.height);
+      const result = await segRef.current.segment(img);
+      const mask = result.categoryMask;
+
+      const out = document.createElement("canvas");
+      out.width = canvas.width;
+      out.height = canvas.height;
+      const octx = out.getContext("2d");
+      const data = octx.createImageData(out.width, out.height);
+      const mdata = mask.getAsUint8Array();
+
+      for (let i = 0; i < mdata.length; i++) {
+        const j = i * 4;
+        data.data[j + 3] = mdata[i] > 127 ? 255 : 0; // Alpha channel
       }
-      canvas = document.createElement("canvas");
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      const ctx = canvas.getContext("2d");
-      ctx.drawImage(video, 0, 0);
+      octx.putImageData(data, 0, 0);
+
+      document.body.appendChild(out); // Preview the mask
+      console.log("Side captured successfully", out);
+      
+      // Detect body features from the mask
+      const measurements = detectBodyFeatures(mdata, canvas.width, canvas.height);
+      setBodyMeasurements(measurements);
+      
+      // Log measurements for debugging
+      console.log("Body measurements detected:", measurements);
+    } catch (error) {
+      console.error("Segmentation failed:", error);
+      alert("Failed to segment image: " + error.message);
+    }
+  };
+
+  // ---- detect body features from segmentation mask ----
+  const detectBodyFeatures = (maskData, width, height) => {
+    if (!scaleMmPerPx) {
+      console.warn("No scale available for measurements");
+      return null;
     }
 
-    const result = await segRef.current.segment(canvas);
-    const mask = result.categoryMask;
+    // Define key vertical positions as percentages from head (0.0) to heel (1.0)
+    // These are approximate body landmarks
+    const landmarks = {
+      chest: 0.30,   // ~30% down from head
+      waist: 0.45,   // ~45% down from head
+      hips: 0.55,    // ~55% down from head
+      thighs: 0.70,  // ~70% down from head
+    };
 
-    const out = document.createElement("canvas");
-    out.width = canvas.width;
-    out.height = canvas.height;
-    const octx = out.getContext("2d");
-    const data = octx.createImageData(out.width, out.height);
-    const mdata = mask.getAsUint8Array();
+    // Convert head/heel Y positions to actual pixel positions
+    const headYPx = (headY / 720) * height;
+    const heelYPx = (heelY / 720) * height;
+    const bodyHeightPx = heelYPx - headYPx;
 
-    for (let i = 0; i < mdata.length; i++) {
-      const j = i * 4;
-      data.data[j + 3] = mdata[i] > 127 ? 255 : 0; // Alpha channel
+    const measurements = {};
+
+    // Calculate horizontal width at each landmark
+    for (const [name, ratio] of Object.entries(landmarks)) {
+      const yPx = Math.floor(headYPx + (bodyHeightPx * ratio));
+      
+      if (yPx < 0 || yPx >= height) {
+        measurements[name] = null;
+        continue;
+      }
+
+      // Scan horizontally to find leftmost and rightmost pixels of body
+      let leftX = -1;
+      let rightX = -1;
+
+      for (let x = 0; x < width; x++) {
+        const idx = yPx * width + x;
+        if (maskData[idx] > 127) { // Body pixel (mask value > 127)
+          if (leftX === -1) leftX = x;
+          rightX = x;
+        }
+      }
+
+      if (leftX >= 0 && rightX >= 0 && rightX > leftX) {
+        const widthPx = rightX - leftX;
+        const widthMm = widthPx * scaleMmPerPx;
+        const widthCm = widthMm / 10;
+        
+        measurements[name] = {
+          pixels: widthPx,
+          mm: Math.round(widthMm),
+          cm: Math.round(widthCm * 10) / 10, // Round to 1 decimal
+          y: yPx,
+          leftX,
+          rightX,
+        };
+      } else {
+        measurements[name] = null;
+      }
     }
-    octx.putImageData(data, 0, 0);
 
-    document.body.appendChild(out); // Preview the mask
-    console.log(`${label} captured`, out);
-  }
+    // Also calculate total body height
+    measurements.height = {
+      pixels: bodyHeightPx,
+      mm: Math.round(bodyHeightPx * scaleMmPerPx),
+      cm: Math.round((bodyHeightPx * scaleMmPerPx / 10) * 10) / 10,
+    };
+
+    return measurements;
+  };
+
+  // Submit to proceed to side capture (resets camera view but keeps scale)
+  const handleSubmit = () => {
+    setCaptureState("side");
+    // Reset to camera view for side capture
+    setCapturedDataUrl(null);
+    capturedCanvasRef.current = null;
+    // Reconnect stream to video element if needed
+    setTimeout(() => {
+      if (videoRef.current && streamRef.current) {
+        videoRef.current.srcObject = streamRef.current;
+        videoRef.current.play().catch(err => console.error("Video play error:", err));
+      }
+    }, 100);
+  };
 
   return (
     <div style={{background:"#0b1220", color:"#e5e7eb", minHeight:"100vh"}}>
@@ -248,25 +482,102 @@ export default function App() {
           {scaleMmPerPx && <span>Scale: {scaleMmPerPx.toFixed(3)} mm/px</span>}
         </div>
 
-        <div style={{display:"flex", gap:12, margin:"12px 0"}}>
-        {!capturedDataUrl ? (
-          <button onClick={typeof countdown === "number"} disabled={typeof countdown === "number"} onClick={startCountdownAndCapture}>
-            {typeof countdown === "number" ? `Capturing in ${countdown}...` : "Capture Photo"}
+        <div style={{display:"flex", gap:12, margin:"12px 0", flexWrap:"wrap"}}>
+          {captureState === null && (
+            <>
+              <button 
+                onClick={handleCaptureFront} 
+                disabled={typeof countdown === "number" || !isModelReady}
+              >
+                {typeof countdown === "number" ? `Capturing in ${countdown}...` : "Capture FRONT"}
+              </button>
+              {capturedDataUrl && (
+                <>
+                  <button onClick={retakePhoto} disabled={typeof countdown === "number"}>
+                    Retake Photo
+                  </button>
+                  <button 
+                    onClick={autoDetectHeadHeel} 
+                    disabled={!capturedDataUrl || !isPoseReady || typeof countdown === "number"}
+                  >
+                    Auto-detect head/heel
+                  </button>
+                </>
+              )}
+            </>
+          )}
+          {captureState === "front" && (
+            <>
+              {capturedDataUrl && (
+                <>
+                  <button onClick={retakePhoto} disabled={typeof countdown === "number"}>
+                    Retake Front Photo
+                  </button>
+                  <button 
+                    onClick={autoDetectHeadHeel} 
+                    disabled={!capturedDataUrl || !isPoseReady || typeof countdown === "number"}
+                  >
+                    Auto-detect head/heel
+                  </button>
+                </>
+              )}
+              <button 
+                onClick={handleSubmit} 
+                disabled={!scaleMmPerPx}
+                style={{background:"#10b981", color:"white", fontWeight:"bold"}}
+              >
+                Submit & Capture Side
+              </button>
+            </>
+          )}
+          {captureState === "side" && (
+            <>
+              <button 
+                onClick={handleCaptureSide} 
+                disabled={typeof countdown === "number" || !isModelReady || !scaleMmPerPx}
+              >
+                {typeof countdown === "number" ? `Capturing in ${countdown}...` : "Capture SIDE"}
+              </button>
+              {capturedDataUrl && (
+                <>
+                  <button onClick={retakePhoto} disabled={typeof countdown === "number"}>
+                    Retake Side Photo
           </button>
-        ) : (
-          <button onClick={retakePhoto} disabled={typeof countdown === "number"}>Retake Photo</button>
-        )}
-          <button disabled={!scaleMmPerPx || !isModelReady} onClick={() => captureSegment("Front")}>
-            Capture FRONT
+                  <button 
+                    onClick={autoDetectHeadHeel} 
+                    disabled={!capturedDataUrl || !isPoseReady || typeof countdown === "number"}
+                  >
+                    Auto-detect head/heel
           </button>
-          <button disabled={!scaleMmPerPx || !isModelReady} onClick={() => captureSegment("Side")}>
-            Capture SIDE
-          </button>
+                </>
+              )}
+            </>
+          )}
         </div>
 
         <div style={{position:"relative", width:"100%", aspectRatio:"16/9", background:"black", borderRadius:12, overflow:"hidden"}}>
         {!capturedDataUrl ? (
-          <video ref={(el)=>{videoRef.current=el; displayRef.current=el;}} className="video" style={{width:"100%", height:"100%", objectFit:"contain"}} playsInline muted />
+          <video 
+            key="camera-video"
+            ref={(el)=>{
+              if (el) {
+                videoRef.current = el;
+                displayRef.current = el;
+                // Reconnect stream if we have one stored
+                if (streamRef.current) {
+                  el.srcObject = streamRef.current;
+                  el.onloadeddata = () => {
+                    el.play().catch(err => console.error("Video play error:", err));
+                  };
+                }
+              }
+            }} 
+            className="video" 
+            style={{width:"100%", height:"100%", objectFit:"contain"}} 
+            playsInline 
+            muted 
+            autoPlay
+          />
         ) : (
           <img ref={displayRef} src={capturedDataUrl} alt="Captured" style={{width:"100%", height:"100%", objectFit:"contain"}} />
         )}
@@ -282,6 +593,62 @@ export default function App() {
         <p style={{opacity:0.7, fontSize:12, marginTop:8}}>
           Tips: phone level (|pitch|,|roll| &lt; 2°), subject centered, full body visible, tight clothing.
         </p>
+
+        {/* Display detected body measurements */}
+        {bodyMeasurements && (
+          <div style={{
+            marginTop: 24,
+            padding: 20,
+            background: "#1f2937",
+            borderRadius: 12,
+            border: "1px solid #374151"
+          }}>
+            <h2 style={{margin: "0 0 16px 0", fontSize: 20}}>Detected Body Measurements</h2>
+            
+            {bodyMeasurements.height && (
+              <div style={{marginBottom: 12, paddingBottom: 12, borderBottom: "1px solid #374151"}}>
+                <strong>Height:</strong> {bodyMeasurements.height.cm} cm ({bodyMeasurements.height.mm} mm)
+              </div>
+            )}
+
+            <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12}}>
+              {bodyMeasurements.chest && (
+                <div style={{padding: 12, background: "#111827", borderRadius: 8}}>
+                  <div style={{fontSize: 12, opacity: 0.7, marginBottom: 4}}>Chest</div>
+                  <div style={{fontSize: 18, fontWeight: "bold"}}>{bodyMeasurements.chest.cm} cm</div>
+                  <div style={{fontSize: 11, opacity: 0.6}}>{bodyMeasurements.chest.mm} mm</div>
+                </div>
+              )}
+              {bodyMeasurements.waist && (
+                <div style={{padding: 12, background: "#111827", borderRadius: 8}}>
+                  <div style={{fontSize: 12, opacity: 0.7, marginBottom: 4}}>Waist</div>
+                  <div style={{fontSize: 18, fontWeight: "bold"}}>{bodyMeasurements.waist.cm} cm</div>
+                  <div style={{fontSize: 11, opacity: 0.6}}>{bodyMeasurements.waist.mm} mm</div>
+                </div>
+              )}
+              {bodyMeasurements.hips && (
+                <div style={{padding: 12, background: "#111827", borderRadius: 8}}>
+                  <div style={{fontSize: 12, opacity: 0.7, marginBottom: 4}}>Hips</div>
+                  <div style={{fontSize: 18, fontWeight: "bold"}}>{bodyMeasurements.hips.cm} cm</div>
+                  <div style={{fontSize: 11, opacity: 0.6}}>{bodyMeasurements.hips.mm} mm</div>
+                </div>
+              )}
+              {bodyMeasurements.thighs && (
+                <div style={{padding: 12, background: "#111827", borderRadius: 8}}>
+                  <div style={{fontSize: 12, opacity: 0.7, marginBottom: 4}}>Thighs</div>
+                  <div style={{fontSize: 18, fontWeight: "bold"}}>{bodyMeasurements.thighs.cm} cm</div>
+                  <div style={{fontSize: 11, opacity: 0.6}}>{bodyMeasurements.thighs.mm} mm</div>
+                </div>
+              )}
+            </div>
+
+            {(!bodyMeasurements.chest && !bodyMeasurements.waist && !bodyMeasurements.hips && !bodyMeasurements.thighs) && (
+              <p style={{opacity: 0.7, fontSize: 14, marginTop: 12}}>
+                Could not detect all measurements. Please ensure the subject is fully visible and well-lit.
+              </p>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

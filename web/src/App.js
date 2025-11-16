@@ -3,8 +3,10 @@ import { FilesetResolver, ImageSegmenter } from "@mediapipe/tasks-vision";
 
 export default function App() {
   const videoRef = useRef(null);
+  const displayRef = useRef(null); // video or captured image
   const overlayRef = useRef(null);
   const segRef = useRef(null);
+  const capturedCanvasRef = useRef(null); // offscreen canvas of captured photo
 
   // user input + draggable lines
   const [heightCm, setHeightCm] = useState(173);
@@ -21,6 +23,10 @@ export default function App() {
 
   // segmentation model
   const [isModelReady, setIsModelReady] = useState(false); // Track model readiness
+  // captured still photo for calibration
+  const [capturedDataUrl, setCapturedDataUrl] = useState(null);
+  // countdown before photo capture
+  const [countdown, setCountdown] = useState(null); // 3..2..1 or null
 
   // ---- camera init ----
   useEffect(() => {
@@ -52,7 +58,9 @@ export default function App() {
         );
         const segmenter = await ImageSegmenter.createFromOptions(fileset, {
           baseOptions: {
-            modelAssetPath: "/models/selfie_segmenter.tflite", // Ensure this path is correct
+            // Use a hosted model URL since there's no local /public/models file
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite",
           },
           outputCategoryMask: true,
           runningMode: "IMAGE",
@@ -69,13 +77,13 @@ export default function App() {
 
   // ---- draw overlay (lines + level bubble + scale readout) ----
   useEffect(() => {
-    const cvs = overlayRef.current, vid = videoRef.current;
-    if (!cvs || !vid) return;
+    const cvs = overlayRef.current, disp = displayRef.current;
+    if (!cvs || !disp) return;
     const ctx = cvs.getContext("2d");
     let raf;
     const draw = () => {
-      const w = (cvs.width = vid.clientWidth);
-      const h = (cvs.height = vid.clientHeight);
+      const w = (cvs.width = disp.clientWidth);
+      const h = (cvs.height = disp.clientHeight);
       ctx.clearRect(0, 0, w, h);
 
       // level bubble
@@ -102,11 +110,29 @@ export default function App() {
         ctx.fillText(txt, w - m.width - 18, 30);
       }
 
+      // countdown overlay
+      if (typeof countdown === "number") {
+        const r = Math.min(w, h) * 0.12;
+        ctx.save();
+        ctx.globalAlpha = 0.85;
+        ctx.fillStyle = "#111827";
+        ctx.beginPath();
+        ctx.arc(w / 2, h / 2, r + 18, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = "white";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.font = `bold ${Math.floor(r)}px system-ui, sans-serif`;
+        ctx.fillText(String(countdown), w / 2, h / 2);
+        ctx.restore();
+      }
+
       raf = requestAnimationFrame(draw);
     };
     draw();
     return () => cancelAnimationFrame(raf);
-  }, [headY, heelY, scaleMmPerPx, pitchDeg, rollDeg]);
+  }, [headY, heelY, scaleMmPerPx, pitchDeg, rollDeg, capturedDataUrl, countdown]);
 
   // ---- drag handlers ----
   const onPointerDown = (e) => {
@@ -134,15 +160,61 @@ export default function App() {
     setScaleMmPerPx((heightCm * 10) / spanPx); // mm per pixel
   };
 
-  // ---- capture and segment handlers ----
-  async function captureSegment(label) {
-    if (!isModelReady) return alert("Segmentation model not ready");
+  // ---- capture still photo for calibration ----
+  const capturePhoto = () => {
     const video = videoRef.current;
+    if (!video || !video.videoWidth || !video.videoHeight) {
+      return alert("Camera not ready yet.");
+    }
     const canvas = document.createElement("canvas");
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
     const ctx = canvas.getContext("2d");
     ctx.drawImage(video, 0, 0);
+    capturedCanvasRef.current = canvas;
+    setCapturedDataUrl(canvas.toDataURL("image/jpeg", 0.9));
+  };
+
+  const startCountdownAndCapture = () => {
+    if (typeof countdown === "number") return;
+    setScaleMmPerPx(null); // reset any prior calibration when taking a new photo
+    let t = 3;
+    setCountdown(t);
+    const interval = setInterval(() => {
+      t -= 1;
+      if (t <= 0) {
+        clearInterval(interval);
+        setCountdown(null);
+        // Slight delay to allow last frame draw
+        setTimeout(() => capturePhoto(), 50);
+      } else {
+        setCountdown(t);
+      }
+    }, 1000);
+  };
+
+  const retakePhoto = () => {
+    capturedCanvasRef.current = null;
+    setCapturedDataUrl(null);
+    setScaleMmPerPx(null);
+  };
+
+  // ---- capture and segment handlers ----
+  async function captureSegment(label) {
+    if (!isModelReady) return alert("Segmentation model not ready");
+    // Use captured still if available, else grab from live video
+    let canvas = capturedCanvasRef.current;
+    if (!canvas) {
+      const video = videoRef.current;
+      if (!video || !video.videoWidth) {
+        return alert("No frame available.");
+      }
+      canvas = document.createElement("canvas");
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(video, 0, 0);
+    }
 
     const result = await segRef.current.segment(canvas);
     const mask = result.categoryMask;
@@ -177,6 +249,13 @@ export default function App() {
         </div>
 
         <div style={{display:"flex", gap:12, margin:"12px 0"}}>
+        {!capturedDataUrl ? (
+          <button onClick={typeof countdown === "number"} disabled={typeof countdown === "number"} onClick={startCountdownAndCapture}>
+            {typeof countdown === "number" ? `Capturing in ${countdown}...` : "Capture Photo"}
+          </button>
+        ) : (
+          <button onClick={retakePhoto} disabled={typeof countdown === "number"}>Retake Photo</button>
+        )}
           <button disabled={!scaleMmPerPx || !isModelReady} onClick={() => captureSegment("Front")}>
             Capture FRONT
           </button>
@@ -186,7 +265,11 @@ export default function App() {
         </div>
 
         <div style={{position:"relative", width:"100%", aspectRatio:"16/9", background:"black", borderRadius:12, overflow:"hidden"}}>
-          <video ref={videoRef} className="video" style={{width:"100%", height:"100%", objectFit:"contain"}} playsInline muted />
+        {!capturedDataUrl ? (
+          <video ref={(el)=>{videoRef.current=el; displayRef.current=el;}} className="video" style={{width:"100%", height:"100%", objectFit:"contain"}} playsInline muted />
+        ) : (
+          <img ref={displayRef} src={capturedDataUrl} alt="Captured" style={{width:"100%", height:"100%", objectFit:"contain"}} />
+        )}
           <canvas
             ref={overlayRef}
             style={{position:"absolute", inset:0}}

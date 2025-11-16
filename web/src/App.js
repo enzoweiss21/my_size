@@ -1,8 +1,10 @@
 import React, { useRef, useEffect, useState } from "react";
+import { FilesetResolver, ImageSegmenter } from "@mediapipe/tasks-vision";
 
 export default function App() {
   const videoRef = useRef(null);
   const overlayRef = useRef(null);
+  const segRef = useRef(null);
 
   // user input + draggable lines
   const [heightCm, setHeightCm] = useState(173);
@@ -18,7 +20,7 @@ export default function App() {
   const [rollDeg, setRollDeg] = useState(0);
 
   // segmentation model
-  const [segmenter, setSegmenter] = useState(null);
+  const [isModelReady, setIsModelReady] = useState(false); // Track model readiness
 
   // ---- camera init ----
   useEffect(() => {
@@ -43,25 +45,26 @@ export default function App() {
 
   // ---- load segmentation model ----
   useEffect(() => {
-    import("@mediapipe/tasks-vision").then(async (vision) => {
-      const { FilesetResolver, ImageSegmenter } = vision;
-      const fileset = await FilesetResolver.forVisionTasks(
-        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
-      );
+    (async () => {
       try {
-        const loadedSegmenter = await ImageSegmenter.createFromOptions(fileset, {
+        const fileset = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+        );
+        const segmenter = await ImageSegmenter.createFromOptions(fileset, {
           baseOptions: {
-            modelAssetPath: "/path/to/local/selfie_segmenter.tflite", // Replace with a valid local or hosted path
+            modelAssetPath: "/models/selfie_segmenter.tflite", // Ensure this path is correct
           },
           outputCategoryMask: true,
           runningMode: "IMAGE",
           categoryAllowlist: ["person"],
         });
-        setSegmenter(loadedSegmenter);
+        segRef.current = segmenter;
+        setIsModelReady(true); // Set model as ready
       } catch (error) {
         console.error("Failed to load segmentation model:", error);
+        alert("Failed to load segmentation model. Please check the model file.");
       }
-    });
+    })();
   }, []);
 
   // ---- draw overlay (lines + level bubble + scale readout) ----
@@ -131,18 +134,35 @@ export default function App() {
     setScaleMmPerPx((heightCm * 10) / spanPx); // mm per pixel
   };
 
-  // ---- capture handlers ----
-  const captureFront = () => {
-    if (!scaleMmPerPx || !segmenter) return;
-    // Placeholder for capturing and processing the front view
-    console.log("Capture FRONT triggered");
-  };
+  // ---- capture and segment handlers ----
+  async function captureSegment(label) {
+    if (!isModelReady) return alert("Segmentation model not ready");
+    const video = videoRef.current;
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(video, 0, 0);
 
-  const captureSide = () => {
-    if (!scaleMmPerPx || !segmenter) return;
-    // Placeholder for capturing and processing the side view
-    console.log("Capture SIDE triggered");
-  };
+    const result = await segRef.current.segment(canvas);
+    const mask = result.categoryMask;
+
+    const out = document.createElement("canvas");
+    out.width = canvas.width;
+    out.height = canvas.height;
+    const octx = out.getContext("2d");
+    const data = octx.createImageData(out.width, out.height);
+    const mdata = mask.getAsUint8Array();
+
+    for (let i = 0; i < mdata.length; i++) {
+      const j = i * 4;
+      data.data[j + 3] = mdata[i] > 127 ? 255 : 0; // Alpha channel
+    }
+    octx.putImageData(data, 0, 0);
+
+    document.body.appendChild(out); // Preview the mask
+    console.log(`${label} captured`, out);
+  }
 
   return (
     <div style={{background:"#0b1220", color:"#e5e7eb", minHeight:"100vh"}}>
@@ -157,10 +177,10 @@ export default function App() {
         </div>
 
         <div style={{display:"flex", gap:12, margin:"12px 0"}}>
-          <button disabled={!scaleMmPerPx} onClick={captureFront}>
+          <button disabled={!scaleMmPerPx || !isModelReady} onClick={() => captureSegment("Front")}>
             Capture FRONT
           </button>
-          <button disabled={!scaleMmPerPx} onClick={captureSide}>
+          <button disabled={!scaleMmPerPx || !isModelReady} onClick={() => captureSegment("Side")}>
             Capture SIDE
           </button>
         </div>

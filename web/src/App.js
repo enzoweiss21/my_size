@@ -186,12 +186,19 @@ export default function App() {
   };
   const onPointerUp = () => setDragging(null);
 
-  // ---- compute scale ----
+  // ---- compute pixel calibration scale ----
+  // This establishes the pixel-to-millimeter conversion ratio using:
+  // - User's known height (heightCm)
+  // - Measured pixel distance between head and heel (spanPx)
+  // Formula: scaleMmPerPx = (heightCm * 10) / spanPx
+  // This calibration is then used with deterministic segmentation scanning
   const lockScale = () => {
     const spanPx = Math.abs(heelY - headY);
     if (spanPx < 200) return alert("Subject too small in frame. Step back.");
     if (Math.abs(pitchDeg) > 2 || Math.abs(rollDeg) > 2) return alert("Hold phone level (|pitch|,|roll| < 2°).");
-    setScaleMmPerPx((heightCm * 10) / spanPx); // mm per pixel
+    const computedScale = (heightCm * 10) / spanPx; // mm per pixel
+    setScaleMmPerPx(computedScale);
+    console.log(`Pixel calibration locked: ${computedScale.toFixed(3)} mm/px (${heightCm}cm / ${spanPx}px)`);
   };
 
   // ---- capture photo helper ----
@@ -202,11 +209,11 @@ export default function App() {
       return null;
     }
     try {
-      const canvas = document.createElement("canvas");
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      const ctx = canvas.getContext("2d");
-      ctx.drawImage(video, 0, 0);
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(video, 0, 0);
       capturedCanvasRef.current = canvas;
       const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
       setCapturedDataUrl(dataUrl);
@@ -353,42 +360,113 @@ export default function App() {
     try {
       console.log("Starting segmentation with image:", img.width, img.height);
       const result = await segRef.current.segment(img);
-      const mask = result.categoryMask;
+    const mask = result.categoryMask;
+    const mdata = mask.getAsUint8Array();
 
-      const out = document.createElement("canvas");
-      out.width = canvas.width;
-      out.height = canvas.height;
-      const octx = out.getContext("2d");
-      const data = octx.createImageData(out.width, out.height);
-      const mdata = mask.getAsUint8Array();
-
-      for (let i = 0; i < mdata.length; i++) {
-        const j = i * 4;
-        data.data[j + 3] = mdata[i] > 127 ? 255 : 0; // Alpha channel
-      }
-      octx.putImageData(data, 0, 0);
-
-      document.body.appendChild(out); // Preview the mask
-      console.log("Side captured successfully", out);
+      // Optionally refine mask with matting (future: MODNet/RVM)
+      // For now, use binary mask directly
+      let refinedMask = mdata;
+      const width = canvas.width;
+      const height = canvas.height;
       
-      // Detect body features from the mask
-      const measurements = detectBodyFeatures(mdata, canvas.width, canvas.height);
+      // Optional matting refinement (can be enabled later with MODNet/RVM)
+      if (false) { // Set to true when matting model is loaded
+        refinedMask = await refineMaskWithMatting(canvas, mdata, width, height);
+      }
+
+      // Create composite: original image over white background using mask
+      const compositeCanvas = document.createElement("canvas");
+      compositeCanvas.width = width;
+      compositeCanvas.height = height;
+      const ctx = compositeCanvas.getContext("2d");
+      
+      // Fill with white background
+      ctx.fillStyle = "#FFFFFF";
+      ctx.fillRect(0, 0, compositeCanvas.width, compositeCanvas.height);
+      
+      // Draw original image
+      ctx.drawImage(canvas, 0, 0);
+      
+      // Apply mask: set alpha channel based on mask data
+      const imageData = ctx.getImageData(0, 0, compositeCanvas.width, compositeCanvas.height);
+      const pixels = imageData.data;
+      
+      for (let i = 0; i < refinedMask.length; i++) {
+        const pixelIdx = i * 4;
+        const maskValue = refinedMask[i];
+        
+        // Binary mask: > 127 = person, <= 127 = background (white)
+        if (maskValue <= 127) {
+          // Set to white for pixels outside mask
+          pixels[pixelIdx] = 255;     // R
+          pixels[pixelIdx + 1] = 255; // G
+          pixels[pixelIdx + 2] = 255; // B
+          pixels[pixelIdx + 3] = 255; // A
+        }
+        // Else keep original pixel (person is visible)
+      }
+      
+      ctx.putImageData(imageData, 0, 0);
+      
+      // Display composite (person over white background)
+      compositeCanvas.style.maxWidth = "100%";
+      compositeCanvas.style.height = "auto";
+      compositeCanvas.style.margin = "16px auto";
+      compositeCanvas.style.display = "block";
+      compositeCanvas.style.border = "2px solid #374151";
+      compositeCanvas.style.borderRadius = "8px";
+      document.body.appendChild(compositeCanvas);
+      
+      console.log("Segmentation complete - composite rendered");
+      
+      // IMPORTANT: Compute measurements from mask data, not rendered RGB image
+      const measurements = detectBodyFeatures(refinedMask, canvas.width, canvas.height);
       setBodyMeasurements(measurements);
       
       // Log measurements for debugging
-      console.log("Body measurements detected:", measurements);
+      console.log("Body measurements detected from mask:", measurements);
     } catch (error) {
       console.error("Segmentation failed:", error);
       alert("Failed to segment image: " + error.message);
     }
   };
 
+  // ---- optional matting refinement (MODNet/RVM) ----
+  // Placeholder for future matting refinement to improve mask edges/hair
+  // This would use MODNet or RVM (Robust Video Matting) for better alpha matting
+  const refineMaskWithMatting = async (canvas, initialMask, width, height) => {
+    // TODO: Implement matting refinement
+    // Example integration points:
+    // - MODNet: https://github.com/ZHKKKe/MODNet
+    // - RVM: https://github.com/PeterL1n/RobustVideoMatting
+    // - TensorFlow.js port or server-side API
+    
+    console.log("Matting refinement not yet implemented, using initial mask");
+    return initialMask; // Return original mask for now
+  };
+
   // ---- detect body features from segmentation mask ----
+  // Uses: Pixel Calibration + Deterministic Segmentation
+  // 
+  // 1. PIXEL CALIBRATION: Uses scaleMmPerPx derived from user's known height
+  //    and measured pixel span (head-to-heel distance in pixels).
+  //    Formula: scaleMmPerPx = (heightCm * 10) / spanPx
+  //
+  // 2. DETERMINISTIC SEGMENTATION: Scans segmentation mask at fixed vertical
+  //    percentages to find body width. No ML/detection models for measurements -
+  //    purely pixel-based deterministic scanning.
+  //
+  // IMPORTANT: This function computes measurements directly from mask data,
+  // not from the rendered RGB composite image. This ensures accurate measurements
+  // regardless of visual rendering (white background, colors, etc.)
   const detectBodyFeatures = (maskData, width, height) => {
     if (!scaleMmPerPx) {
       console.warn("No scale available for measurements");
       return null;
     }
+    
+    // maskData is a Uint8Array where each value represents mask confidence
+    // Values > 127 typically indicate person pixels
 
     // Define key vertical positions as percentages from head (0.0) to heel (1.0)
     // These are approximate body landmarks
@@ -455,6 +533,58 @@ export default function App() {
     return measurements;
   };
 
+  // ---- upload photo handlers (for testing) ----
+  const handleFileUpload = async (event, type) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    if (!file.type.startsWith('image/')) {
+      alert("Please upload an image file");
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        // Create canvas from uploaded image
+        const canvas = document.createElement("canvas");
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0);
+        
+        // Store canvas and data URL
+        capturedCanvasRef.current = canvas;
+        const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
+        setCapturedDataUrl(dataUrl);
+
+        if (type === "front") {
+          // Process as front photo
+          setFrontImageData(dataUrl);
+          setCaptureState("front");
+        } else if (type === "side") {
+          // Process as side photo for segmentation
+          setCaptureState("side");
+          // Trigger segmentation immediately if scale is locked
+          if (scaleMmPerPx && isModelReady) {
+            performSideSegmentation(canvas).catch(err => {
+              console.error("Segmentation error from upload:", err);
+            });
+          }
+        }
+      };
+      img.src = e.target.result;
+    };
+    reader.onerror = () => {
+      alert("Failed to read file");
+    };
+    reader.readAsDataURL(file);
+    
+    // Reset file input so same file can be selected again
+    event.target.value = '';
+  };
+
   // Submit to proceed to side capture (resets camera view but keeps scale)
   const handleSubmit = () => {
     setCaptureState("side");
@@ -482,7 +612,7 @@ export default function App() {
           {scaleMmPerPx && <span>Scale: {scaleMmPerPx.toFixed(3)} mm/px</span>}
         </div>
 
-        <div style={{display:"flex", gap:12, margin:"12px 0", flexWrap:"wrap"}}>
+        <div style={{display:"flex", gap:12, margin:"12px 0", flexWrap:"wrap", alignItems:"center"}}>
           {captureState === null && (
             <>
               <button 
@@ -491,6 +621,24 @@ export default function App() {
               >
                 {typeof countdown === "number" ? `Capturing in ${countdown}...` : "Capture FRONT"}
               </button>
+              {/* Upload option for testing */}
+              <label style={{
+                padding: "8px 16px",
+                background: "#374151",
+                border: "1px solid #4B5563",
+                borderRadius: "6px",
+                cursor: "pointer",
+                fontSize: "14px",
+                display: "inline-block"
+              }}>
+                📁 Upload Front (test)
+                <input
+                  type="file"
+                  accept="image/*"
+                  style={{display: "none"}}
+                  onChange={(e) => handleFileUpload(e, "front")}
+                />
+              </label>
               {capturedDataUrl && (
                 <>
                   <button onClick={retakePhoto} disabled={typeof countdown === "number"}>
@@ -538,6 +686,26 @@ export default function App() {
               >
                 {typeof countdown === "number" ? `Capturing in ${countdown}...` : "Capture SIDE"}
               </button>
+              {/* Upload option for testing */}
+              <label style={{
+                padding: "8px 16px",
+                background: (!scaleMmPerPx || !isModelReady) ? "#1F2937" : "#374151",
+                border: "1px solid #4B5563",
+                borderRadius: "6px",
+                cursor: (!scaleMmPerPx || !isModelReady) ? "not-allowed" : "pointer",
+                fontSize: "14px",
+                display: "inline-block",
+                opacity: (!scaleMmPerPx || !isModelReady) ? 0.5 : 1
+              }}>
+                📁 Upload Side (test)
+                <input
+                  type="file"
+                  accept="image/*"
+                  style={{display: "none"}}
+                  onChange={(e) => handleFileUpload(e, "side")}
+                  disabled={!scaleMmPerPx || !isModelReady}
+                />
+              </label>
               {capturedDataUrl && (
                 <>
                   <button onClick={retakePhoto} disabled={typeof countdown === "number"}>

@@ -433,8 +433,8 @@ export default function App() {
       let refinedMask = new Uint8Array(mdata.length);
       const probabilityThreshold = 0.7;
       const thresholdValue = Math.round(probabilityThreshold * 255); // 178.5 → 178
-      
-      for (let i = 0; i < mdata.length; i++) {
+
+    for (let i = 0; i < mdata.length; i++) {
         // Threshold mask: only keep pixels with p ≥ 0.7
         refinedMask[i] = mdata[i] >= thresholdValue ? 255 : 0;
       }
@@ -1093,11 +1093,12 @@ export default function App() {
         }
       } else {
         // Side depth guardrails (as fractions of height)
+        // Lowered minimums based on actual measurements (chest/waist typically 10-15% of height)
         if (name === "chest") {
-          landmarkMinCm = bodyHeightCm * 0.18;
+          landmarkMinCm = bodyHeightCm * 0.10; // Lowered from 0.18 (was 30.6cm for 170cm, now 17cm)
           landmarkMaxCm = bodyHeightCm * 0.28;
         } else if (name === "waist") {
-          landmarkMinCm = bodyHeightCm * 0.18;
+          landmarkMinCm = bodyHeightCm * 0.14; // Lowered from 0.18 (was 30.6cm for 170cm, now 23.8cm)
           landmarkMaxCm = bodyHeightCm * 0.28;
         } else if (name === "hips") {
           landmarkMinCm = bodyHeightCm * 0.18;
@@ -1362,7 +1363,7 @@ export default function App() {
                 disabled={typeof countdown === "number" || !isModelReady}
               >
                 {typeof countdown === "number" ? `Capturing in ${countdown}...` : "Capture FRONT"}
-              </button>
+          </button>
               {/* Upload option for testing */}
               <label style={{
                 padding: "8px 16px",
@@ -1385,7 +1386,7 @@ export default function App() {
                 <>
                   <button onClick={retakePhoto} disabled={typeof countdown === "number"}>
                     Retake Photo
-                  </button>
+          </button>
                   <button 
                     onClick={autoDetectHeadHeel} 
                     disabled={!capturedDataUrl || !isPoseReady || typeof countdown === "number"}

@@ -1383,7 +1383,12 @@ export default function App() {
 
   // Manual drawing: handle clicking on image to place dots
   const handleManualImageClick = (e, photoType) => {
-    if (!capturedCanvasRef.current || !scaleMmPerPx) return;
+    if (!capturedCanvasRef.current) return;
+    
+    if (!scaleMmPerPx) {
+      alert("Please lock the scale first before placing dots.");
+      return;
+    }
     
     const rect = e.currentTarget.getBoundingClientRect();
     const scaleX = capturedCanvasRef.current.width / rect.width;
@@ -1506,8 +1511,13 @@ export default function App() {
 
   // Manual drawing: submit and calculate
   const handleManualSubmit = () => {
+    if (!scaleMmPerPx) {
+      alert("Please lock the scale first before calculating measurements.");
+      return;
+    }
+    
     const measurements = calculateManualMeasurements();
-    if (measurements.waist3D) {
+    if (measurements && measurements.waist3D) {
       setBodyMeasurements({ waist: measurements.waist3D });
       console.log("Manual measurements calculated:", measurements);
     } else {
@@ -1804,19 +1814,18 @@ export default function App() {
             <>
               <button 
                 onClick={handleManualCaptureFront} 
-                disabled={typeof countdown === "number" || !scaleMmPerPx}
+                disabled={typeof countdown === "number"}
               >
                 {typeof countdown === "number" ? `Capturing in ${countdown}...` : "Capture FRONT"}
               </button>
               <label style={{
                 padding: "8px 16px",
-                background: (!scaleMmPerPx) ? "#1F2937" : "#374151",
+                background: "#374151",
                 border: "1px solid #4B5563",
                 borderRadius: "6px",
-                cursor: (!scaleMmPerPx) ? "not-allowed" : "pointer",
+                cursor: "pointer",
                 fontSize: "14px",
-                display: "inline-block",
-                opacity: (!scaleMmPerPx) ? 0.5 : 1
+                display: "inline-block"
               }}>
                 📁 Upload Front Photo
                 <input
@@ -1824,13 +1833,17 @@ export default function App() {
                   accept="image/*"
                   style={{display: "none"}}
                   onChange={(e) => handleManualFileUpload(e, "front")}
-                  disabled={!scaleMmPerPx}
                 />
               </label>
               {capturedDataUrl && (
                 <button onClick={retakePhoto} disabled={typeof countdown === "number"}>
                   Retake Photo
                 </button>
+              )}
+              {!scaleMmPerPx && (
+                <span style={{opacity: 0.7, fontSize: 12, marginLeft: 8}}>
+                  ⚠️ Lock scale before placing dots to measure
+                </span>
               )}
             </>
           )}
@@ -1869,19 +1882,18 @@ export default function App() {
             <>
               <button 
                 onClick={handleManualCaptureSide} 
-                disabled={typeof countdown === "number" || !scaleMmPerPx}
+                disabled={typeof countdown === "number"}
               >
                 {typeof countdown === "number" ? `Capturing in ${countdown}...` : "Capture SIDE"}
               </button>
               <label style={{
                 padding: "8px 16px",
-                background: (!scaleMmPerPx) ? "#1F2937" : "#374151",
+                background: "#374151",
                 border: "1px solid #4B5563",
                 borderRadius: "6px",
-                cursor: (!scaleMmPerPx) ? "not-allowed" : "pointer",
+                cursor: "pointer",
                 fontSize: "14px",
-                display: "inline-block",
-                opacity: (!scaleMmPerPx) ? 0.5 : 1
+                display: "inline-block"
               }}>
                 📁 Upload Side Photo
                 <input
@@ -1889,7 +1901,6 @@ export default function App() {
                   accept="image/*"
                   style={{display: "none"}}
                   onChange={(e) => handleManualFileUpload(e, "side")}
-                  disabled={!scaleMmPerPx}
                 />
               </label>
             </>

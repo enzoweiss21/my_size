@@ -148,14 +148,19 @@ export default function App() {
       ctx.fillText(`roll: ${rollDeg.toFixed(1)}°`, 20, 52);
 
       // draggable lines (map 0..720 to canvas height)
-      // Only show calibration lines during calibration phase, not during dot placement
-      if (!(mode === "manual" && (manualCaptureState === "front-dots" || manualCaptureState === "side-dots"))) {
-      const yHeadPx = (headY / 720) * h;
-      const yHeelPx = (heelY / 720) * h;
-      ctx.strokeStyle = "#60a5fa"; ctx.lineWidth = 3; ctx.setLineDash([8,6]);
-      ctx.beginPath(); ctx.moveTo(0, yHeadPx); ctx.lineTo(w, yHeadPx); ctx.stroke();
-      ctx.beginPath(); ctx.moveTo(0, yHeelPx); ctx.lineTo(w, yHeelPx); ctx.stroke();
-      ctx.setLineDash([]);
+      // Show calibration lines during calibration phase (both pose and manual modes)
+      // Hide them only during dot placement in manual mode
+      const shouldShowCalibrationLines = mode === "pose" || 
+        (mode === "manual" && manualCaptureState === "calibration") ||
+        (mode === "manual" && manualCaptureState === "side-capture");
+      
+      if (shouldShowCalibrationLines) {
+        const yHeadPx = (headY / 720) * h;
+        const yHeelPx = (heelY / 720) * h;
+        ctx.strokeStyle = "#60a5fa"; ctx.lineWidth = 3; ctx.setLineDash([8,6]);
+        ctx.beginPath(); ctx.moveTo(0, yHeadPx); ctx.lineTo(w, yHeadPx); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(0, yHeelPx); ctx.lineTo(w, yHeelPx); ctx.stroke();
+        ctx.setLineDash([]);
       }
 
       if (scaleMmPerPx) {
@@ -1947,6 +1952,13 @@ export default function App() {
               playsInline 
               muted 
               autoPlay
+            />
+          ) : manualCaptureState === "calibration" && capturedDataUrl ? (
+            <img 
+              ref={displayRef} 
+              src={capturedDataUrl} 
+              alt="Captured for Calibration" 
+              style={{width:"100%", height:"100%", objectFit:"contain"}}
             />
           ) : manualCaptureState === "front-dots" ? (
             <img 

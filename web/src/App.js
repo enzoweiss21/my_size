@@ -34,6 +34,11 @@ export default function App() {
   const [frontImageData, setFrontImageData] = useState(null);
   // capture state: null = calibration, "front" = front captured, "side" = ready for side
   const [captureState, setCaptureState] = useState(null); // null | "front" | "side"
+  // side photo data (separate from capturedDataUrl for calibration)
+  const [sideImageData, setSideImageData] = useState(null);
+  // segmentation composites (white background masks)
+  const [frontComposite, setFrontComposite] = useState(null);
+  const [sideComposite, setSideComposite] = useState(null);
   // detected body features/measurements
   const [bodyMeasurements, setBodyMeasurements] = useState(null);
 
@@ -166,7 +171,7 @@ export default function App() {
     };
     draw();
     return () => cancelAnimationFrame(raf);
-  }, [headY, heelY, scaleMmPerPx, pitchDeg, rollDeg, capturedDataUrl, countdown]);
+  }, [headY, heelY, scaleMmPerPx, pitchDeg, rollDeg, capturedDataUrl, sideImageData, countdown]);
 
   // ---- drag handlers ----
   const onPointerDown = (e) => {
@@ -252,6 +257,9 @@ export default function App() {
   const retakePhoto = () => {
     capturedCanvasRef.current = null;
     setCapturedDataUrl(null);
+    if (captureState === "side") {
+      setSideImageData(null); // Clear side image when retaking
+    }
     if (captureState === null) {
       setScaleMmPerPx(null); // Only reset scale if we're in initial calibration
     }
@@ -305,40 +313,75 @@ export default function App() {
     });
   };
 
-  // ---- capture side photo and segment ----
-  const handleCaptureSide = async () => {
-    if (!isModelReady) return alert("Segmentation model not ready");
-    if (!scaleMmPerPx) return alert("Please lock scale first");
+  // ---- capture side photo (doesn't segment yet) ----
+  const handleCaptureSide = () => {
+    if (typeof countdown === "number") return;
     
-    // If we already have a captured photo, use it; otherwise take a new one
+    // If we already have a captured photo, save it as side image
     let canvas = capturedCanvasRef.current;
     if (!canvas) {
       // No photo yet, start countdown and capture
-      if (typeof countdown === "number") return;
-      startCountdownAndCapture(async (capturedCanvas) => {
+      startCountdownAndCapture((capturedCanvas) => {
         if (!capturedCanvas) {
           console.error("Failed to capture canvas");
           return;
         }
-        await performSideSegmentation(capturedCanvas);
+        // Save side image
+        const sideDataUrl = capturedCanvas.toDataURL("image/jpeg", 0.9);
+        setSideImageData(sideDataUrl);
+        capturedCanvasRef.current = capturedCanvas;
+        setCapturedDataUrl(sideDataUrl);
       });
       return;
     }
     
     // Use existing captured photo
-    await performSideSegmentation(canvas);
+    const sideDataUrl = canvas.toDataURL("image/jpeg", 0.9);
+    setSideImageData(sideDataUrl);
+    setCapturedDataUrl(sideDataUrl);
   };
 
-  const performSideSegmentation = async (canvas) => {
+  // ---- submit side photo and calculate measurements ----
+  const handleSubmitSide = async () => {
+    if (!isModelReady) return alert("Segmentation model not ready");
+    if (!scaleMmPerPx) return alert("Please lock scale first");
+    if (!sideImageData && !capturedCanvasRef.current) {
+      return alert("Please capture or upload a side photo first");
+    }
+
+    // Use the saved side image canvas
+    const canvas = capturedCanvasRef.current;
+    if (!canvas) {
+      // Recreate canvas from side image data
+      const img = new Image();
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = reject;
+        img.src = sideImageData;
+      });
+      const newCanvas = document.createElement("canvas");
+      newCanvas.width = img.width;
+      newCanvas.height = img.height;
+      const ctx = newCanvas.getContext("2d");
+      ctx.drawImage(img, 0, 0);
+      capturedCanvasRef.current = newCanvas;
+      await performSideSegmentation(newCanvas);
+    } else {
+      await performSideSegmentation(canvas);
+    }
+  };
+
+  // ---- create segmentation composite (reusable for front and side) ----
+  const createSegmentationComposite = async (canvas) => {
     if (!canvas) {
       console.error("No canvas provided for segmentation");
-      return;
+      return null;
     }
 
     // Test if canvas is valid by checking dimensions
     if (!canvas.width || !canvas.height) {
       console.error("Invalid canvas dimensions:", canvas.width, canvas.height);
-      return;
+      return null;
     }
 
     // Convert canvas to Image element (MediaPipe prefers Image or Video elements)
@@ -360,8 +403,8 @@ export default function App() {
     try {
       console.log("Starting segmentation with image:", img.width, img.height);
       const result = await segRef.current.segment(img);
-    const mask = result.categoryMask;
-    const mdata = mask.getAsUint8Array();
+      const mask = result.categoryMask;
+      const mdata = mask.getAsUint8Array();
 
       // Optionally refine mask with matting (future: MODNet/RVM)
       // For now, use binary mask directly
@@ -408,25 +451,50 @@ export default function App() {
       
       ctx.putImageData(imageData, 0, 0);
       
-      // Display composite (person over white background)
-      compositeCanvas.style.maxWidth = "100%";
-      compositeCanvas.style.height = "auto";
-      compositeCanvas.style.margin = "16px auto";
-      compositeCanvas.style.display = "block";
-      compositeCanvas.style.border = "2px solid #374151";
-      compositeCanvas.style.borderRadius = "8px";
-      document.body.appendChild(compositeCanvas);
+      return {
+        compositeCanvas,
+        maskData: refinedMask,
+        width,
+        height
+      };
+    } catch (error) {
+      console.error("Segmentation failed:", error);
+      throw error;
+    }
+  };
+
+  // ---- perform front segmentation ----
+  const performFrontSegmentation = async (canvas) => {
+    try {
+      const result = await createSegmentationComposite(canvas);
+      if (result) {
+        setFrontComposite(result.compositeCanvas.toDataURL("image/png"));
+        console.log("Front segmentation complete");
+      }
+    } catch (error) {
+      console.error("Front segmentation failed:", error);
+    }
+  };
+
+  // ---- perform side segmentation and calculate measurements ----
+  const performSideSegmentation = async (canvas) => {
+    try {
+      const result = await createSegmentationComposite(canvas);
+      if (!result) return;
+
+      // Store side composite
+      setSideComposite(result.compositeCanvas.toDataURL("image/png"));
       
-      console.log("Segmentation complete - composite rendered");
+      console.log("Side segmentation complete - composite rendered");
       
       // IMPORTANT: Compute measurements from mask data, not rendered RGB image
-      const measurements = detectBodyFeatures(refinedMask, canvas.width, canvas.height);
+      const measurements = detectBodyFeatures(result.maskData, result.width, result.height);
       setBodyMeasurements(measurements);
       
       // Log measurements for debugging
       console.log("Body measurements detected from mask:", measurements);
     } catch (error) {
-      console.error("Segmentation failed:", error);
+      console.error("Side segmentation failed:", error);
       alert("Failed to segment image: " + error.message);
     }
   };
@@ -564,14 +632,10 @@ export default function App() {
           setFrontImageData(dataUrl);
           setCaptureState("front");
         } else if (type === "side") {
-          // Process as side photo for segmentation
+          // Process as side photo - save but don't segment yet
           setCaptureState("side");
-          // Trigger segmentation immediately if scale is locked
-          if (scaleMmPerPx && isModelReady) {
-            performSideSegmentation(canvas).catch(err => {
-              console.error("Segmentation error from upload:", err);
-            });
-          }
+          setSideImageData(dataUrl);
+          // Don't trigger segmentation yet - wait for explicit submit
         }
       };
       img.src = e.target.result;
@@ -586,7 +650,23 @@ export default function App() {
   };
 
   // Submit to proceed to side capture (resets camera view but keeps scale)
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
+    // Segment front photo before moving to side
+    if (frontImageData && isModelReady) {
+      const img = new Image();
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = reject;
+        img.src = frontImageData;
+      });
+      const canvas = document.createElement("canvas");
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(img, 0, 0);
+      await performFrontSegmentation(canvas);
+    }
+
     setCaptureState("side");
     // Reset to camera view for side capture
     setCapturedDataUrl(null);
@@ -706,16 +786,23 @@ export default function App() {
                   disabled={!scaleMmPerPx || !isModelReady}
                 />
               </label>
-              {capturedDataUrl && (
+              {(capturedDataUrl || sideImageData) && (
                 <>
                   <button onClick={retakePhoto} disabled={typeof countdown === "number"}>
                     Retake Side Photo
-          </button>
+                  </button>
                   <button 
                     onClick={autoDetectHeadHeel} 
-                    disabled={!capturedDataUrl || !isPoseReady || typeof countdown === "number"}
+                    disabled={(!capturedDataUrl && !sideImageData) || !isPoseReady || typeof countdown === "number"}
                   >
                     Auto-detect head/heel
+          </button>
+                  <button
+                    onClick={handleSubmitSide}
+                    disabled={!scaleMmPerPx || !isModelReady || typeof countdown === "number"}
+                    style={{background:"#10b981", color:"white", fontWeight:"bold"}}
+                  >
+                    Submit Side & Calculate
           </button>
                 </>
               )}
@@ -724,7 +811,7 @@ export default function App() {
         </div>
 
         <div style={{position:"relative", width:"100%", aspectRatio:"16/9", background:"black", borderRadius:12, overflow:"hidden"}}>
-        {!capturedDataUrl ? (
+        {!capturedDataUrl && !sideImageData ? (
           <video 
             key="camera-video"
             ref={(el)=>{
@@ -747,7 +834,7 @@ export default function App() {
             autoPlay
           />
         ) : (
-          <img ref={displayRef} src={capturedDataUrl} alt="Captured" style={{width:"100%", height:"100%", objectFit:"contain"}} />
+          <img ref={displayRef} src={sideImageData || capturedDataUrl} alt="Captured" style={{width:"100%", height:"100%", objectFit:"contain"}} />
         )}
           <canvas
             ref={overlayRef}
@@ -761,6 +848,51 @@ export default function App() {
         <p style={{opacity:0.7, fontSize:12, marginTop:8}}>
           Tips: phone level (|pitch|,|roll| &lt; 2°), subject centered, full body visible, tight clothing.
         </p>
+
+        {/* Display segmentation composites (front and side) */}
+        {(frontComposite || sideComposite) && (
+          <div style={{
+            marginTop: 24,
+            padding: 20,
+            background: "#1f2937",
+            borderRadius: 12,
+            border: "1px solid #374151"
+          }}>
+            <h2 style={{margin: "0 0 16px 0", fontSize: 20}}>Body Segmentation Masks</h2>
+            <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 16}}>
+              {frontComposite && (
+                <div>
+                  <h3 style={{margin: "0 0 8px 0", fontSize: 16, opacity: 0.9}}>Front View</h3>
+                  <img 
+                    src={frontComposite} 
+                    alt="Front segmentation" 
+                    style={{
+                      width: "100%",
+                      height: "auto",
+                      borderRadius: 8,
+                      border: "2px solid #374151"
+                    }}
+                  />
+                </div>
+              )}
+              {sideComposite && (
+                <div>
+                  <h3 style={{margin: "0 0 8px 0", fontSize: 16, opacity: 0.9}}>Side View</h3>
+                  <img 
+                    src={sideComposite} 
+                    alt="Side segmentation" 
+                    style={{
+                      width: "100%",
+                      height: "auto",
+                      borderRadius: 8,
+                      border: "2px solid #374151"
+                    }}
+                  />
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* Display detected body measurements */}
         {bodyMeasurements && (

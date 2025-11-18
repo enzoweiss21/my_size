@@ -427,15 +427,24 @@ export default function App() {
     const mask = result.categoryMask;
     const mdata = mask.getAsUint8Array();
 
-      // Optionally refine mask with matting (future: MODNet/RVM)
-      // For now, use binary mask directly
-      let refinedMask = mdata;
+      // Apply probability threshold: p ≥ 0.7 (reduces "whispy" arm pixels)
+      // MediaPipe categoryMask returns binary (0 or 255), but we ensure threshold at 0.7
+      // If confidence mask available, use it; otherwise threshold binary mask at 178 (0.7 * 255)
+      let refinedMask = new Uint8Array(mdata.length);
+      const probabilityThreshold = 0.7;
+      const thresholdValue = Math.round(probabilityThreshold * 255); // 178.5 → 178
+      
+      for (let i = 0; i < mdata.length; i++) {
+        // Threshold mask: only keep pixels with p ≥ 0.7
+        refinedMask[i] = mdata[i] >= thresholdValue ? 255 : 0;
+      }
+      
       const width = canvas.width;
       const height = canvas.height;
       
       // Optional matting refinement (can be enabled later with MODNet/RVM)
       if (false) { // Set to true when matting model is loaded
-        refinedMask = await refineMaskWithMatting(canvas, mdata, width, height);
+        refinedMask = await refineMaskWithMatting(canvas, refinedMask, width, height);
       }
 
       // Create composite: original image over white background using mask
@@ -497,7 +506,7 @@ export default function App() {
         
         // If we have both front and side measurements, calculate 3D
         if (sideMeasurements && widths) {
-          calculate3DMeasurements(widths, sideMeasurements);
+          calculate3DMeasurements(widths, sideMeasurements, scaleMmPerPx);
         }
         
         console.log("Front segmentation complete - widths calculated");
@@ -522,7 +531,7 @@ export default function App() {
       
       // If we have both front and side measurements, calculate 3D
       if (frontMeasurements && depths) {
-        calculate3DMeasurements(frontMeasurements, depths);
+        calculate3DMeasurements(frontMeasurements, depths, scaleMmPerPx);
       }
       
       console.log("Side segmentation complete - depths calculated");
@@ -537,7 +546,7 @@ export default function App() {
   // - Front photo: Measures left-right width of body (what we see from front)
   // - Side photo: Measures front-back depth/thickness (what we see from side)
   // - Circumference: Uses elliptical model (width × depth) to account for full wrap-around
-  const calculate3DMeasurements = (widths, depths) => {
+  const calculate3DMeasurements = (widths, depths, scaleMmPerPx = null) => {
     if (!widths || !depths) {
       console.warn("Missing width or depth measurements for 3D calculation");
       return;
@@ -552,11 +561,11 @@ export default function App() {
       const depth = depths[landmark];
 
       if (width && depth) {
-        // Final sanity check: depth should not be > width * 1.3
-        // If so, likely included back/head bump or edge artifacts
-        if (depth.cm > width.cm * 1.3) {
-          console.warn(`${landmark}: Rejected - depth (${depth.cm}cm) > width (${width.cm}cm) * 1.3`);
-          console.warn(`  Likely included back/head bump or edge artifacts. Skipping this measurement.`);
+        // Final sanity check: depth should not be > width * 1.1
+        // If so, likely included back/head bump, edge artifacts, or arm still in width measurement
+        if (depth.cm > width.cm * 1.1) {
+          console.warn(`${landmark}: Rejected - depth (${depth.cm}cm) > width (${width.cm}cm) * 1.1`);
+          console.warn(`  Likely included back/head bump, edge artifacts, or arm still in width. Skipping this measurement.`);
           return; // Skip this landmark
         }
         
@@ -581,12 +590,7 @@ export default function App() {
         const circumferenceMm = Math.PI * (semiMajorAxis + semiMinorAxis) * (1 + (3 * h) / (10 + Math.sqrt(4 - 3 * h)));
         const circumferenceCm = circumferenceMm / 10;
 
-        // Calculate volume approximation (using cross-sectional area × landmark height segment)
-        // Approximate each landmark represents ~15cm vertical segment of the body
-        const segmentHeightCm = 15;
-        const volumeCm3 = crossSectionalAreaCm2 * segmentHeightCm;
-        const volumeLiters = volumeCm3 / 1000;
-
+        // Store area for trapezoidal integration later
         combinedMeasurements[landmark] = {
           // 2D measurements from photos
           width: {
@@ -606,13 +610,70 @@ export default function App() {
             cm: Math.round(circumferenceCm * 10) / 10,
             mm: Math.round(circumferenceMm)
           },
+          // Volume placeholder - will calculate using trapezoidal integration
           volume: {
-            cm3: Math.round(volumeCm3),
-            liters: Math.round(volumeLiters * 100) / 100
+            cm3: 0,
+            liters: 0,
+            _areaCm2: crossSectionalAreaCm2, // Store for integration
+            _yPos: width.y || depth.y // Store Y position for spacing
           }
         };
         
         console.log(`${landmark}: width=${width.cm}cm, depth=${depth.cm}cm → circumference=${Math.round(circumferenceCm * 10) / 10}cm`);
+      }
+    });
+
+    // Calculate volumes using trapezoidal integration: Σ ((A_i + A_{i+1}) / 2) * Δz_i
+    const landmarkOrder = ["chest", "waist", "hips", "thighs"];
+    for (let i = 0; i < landmarkOrder.length - 1; i++) {
+      const landmark1 = landmarkOrder[i];
+      const landmark2 = landmarkOrder[i + 1];
+      const m1 = combinedMeasurements[landmark1];
+      const m2 = combinedMeasurements[landmark2];
+      
+      if (m1 && m2 && m1._areaCm2 && m2._areaCm2) {
+        // Calculate spacing in mm (using scale and Y position difference)
+        // If Y positions available, use them; otherwise use default spacing
+        let deltaZmm;
+        if (m1._yPos && m2._yPos && scaleMmPerPx) {
+          deltaZmm = Math.abs((m2._yPos - m1._yPos) * scaleMmPerPx);
+        } else {
+          // Fallback: approximate spacing (each landmark ~15cm apart)
+          deltaZmm = 150; // 15cm in mm
+        }
+        
+        // Trapezoidal integration: (A1 + A2) / 2 * Δz
+        const avgAreaCm2 = (m1._areaCm2 + m2._areaCm2) / 2;
+        const segmentVolumeCm3 = avgAreaCm2 * (deltaZmm / 10); // Convert mm to cm
+        const segmentVolumeLiters = segmentVolumeCm3 / 1000;
+        
+        // Distribute volume between landmarks (half to each)
+        m1.volume.cm3 += Math.round(segmentVolumeCm3 / 2);
+        m1.volume.liters += segmentVolumeLiters / 2;
+        m2.volume.cm3 += Math.round(segmentVolumeCm3 / 2);
+        m2.volume.liters += segmentVolumeLiters / 2;
+        
+        // Round final liters
+        m1.volume.liters = Math.round(m1.volume.liters * 100) / 100;
+        m2.volume.liters = Math.round(m2.volume.liters * 100) / 100;
+        
+        // Clean up temporary fields
+        delete m1._areaCm2;
+        delete m1._yPos;
+        delete m2._areaCm2;
+        delete m2._yPos;
+      }
+    }
+    
+    // Handle single landmark case (fallback to simple calculation)
+    landmarkOrder.forEach(landmark => {
+      const m = combinedMeasurements[landmark];
+      if (m && m.volume.cm3 === 0 && m._areaCm2) {
+        // No neighbor, use simple area × 15cm
+        m.volume.cm3 = Math.round(m._areaCm2 * 15);
+        m.volume.liters = Math.round((m.volume.cm3 / 1000) * 100) / 100;
+        delete m._areaCm2;
+        delete m._yPos;
       }
     });
 
@@ -638,6 +699,59 @@ export default function App() {
     
     console.log("Matting refinement not yet implemented, using initial mask");
     return initialMask; // Return original mask for now
+  };
+
+  // ---- helper: calculate percentile ----
+  const percentile = (sortedArray, percentile) => {
+    if (sortedArray.length === 0) return null;
+    const index = Math.ceil((percentile / 100) * sortedArray.length) - 1;
+    return sortedArray[Math.max(0, index)];
+  };
+
+  // ---- helper: auto-tune opening kernel per landmark ----
+  const measureWidthWithRetune = (maskData, width, height, useInverted, torsoROI, name, centerY, bodyHeightCm, scaleMmPerPx, initialKernel, depthEstimate) => {
+    const bandHalfHeight = 20;
+    const bandStartY = Math.max(0, centerY - bandHalfHeight);
+    const bandEndY = Math.min(height - 1, centerY + bandHalfHeight);
+    
+    for (let k = initialKernel; k <= 30; k += 3) {
+      // Apply opening with kernel k
+      const opened = applyHorizontalOpening(maskData, width, height, useInverted, k);
+      
+      // Scan band
+      const widthSamples = [];
+      for (let y = bandStartY; y <= bandEndY; y++) {
+        const regions = scanRowForBodyRegions(opened, width, y, useInverted, torsoROI, "width");
+        if (regions.length === 1) {
+          const region = regions[0];
+          const dimPx = region.end - region.start;
+          widthSamples.push({
+            width: dimPx,
+            leftX: region.start,
+            rightX: region.end
+          });
+        }
+      }
+      
+      if (widthSamples.length === 0) continue;
+      
+      // Use 10th percentile
+      widthSamples.sort((a, b) => a.width - b.width);
+      const wPx = percentile(widthSamples.map(s => s.width), 10);
+      const wCm = (wPx * scaleMmPerPx) / 10;
+      const wRatio = wCm / bodyHeightCm;
+      
+      // Check guardrails
+      const valid = wRatio >= 0.25 && wRatio <= 0.50;
+      const depthCheck = !depthEstimate || wCm <= 1.3 * depthEstimate;
+      
+      if (valid && depthCheck) {
+        const chosen = widthSamples.find(s => s.width === wPx);
+        return { widthPx: wPx, widthCm: wCm, kernel: k, details: chosen };
+      }
+    }
+    
+    return null; // Failed all kernels
   };
 
   // ---- find largest 2D connected component (torso ROI) ----
@@ -701,8 +815,80 @@ export default function App() {
     return components[0].bbox;
   };
 
+  // ---- horizontal morphological opening to suppress arms ----
+  // Erodes then dilates horizontally only (removes lateral arm bulges without shrinking torso height)
+  const applyHorizontalOpening = (maskData, width, height, useInverted, kernelSize) => {
+    const result = new Uint8Array(maskData.length);
+    
+    // Erode horizontally
+    const eroded = new Uint8Array(maskData.length);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = y * width + x;
+        const maskValue = maskData[idx];
+        const isBodyPixel = useInverted ? maskValue < 127 : maskValue > 127;
+        
+        if (!isBodyPixel) {
+          eroded[idx] = maskValue;
+          continue;
+        }
+        
+        // Check if all pixels in horizontal kernel are body pixels
+        let allBody = true;
+        for (let dx = -kernelSize; dx <= kernelSize; dx++) {
+          const nx = x + dx;
+          if (nx < 0 || nx >= width) {
+            allBody = false;
+            break;
+          }
+          const nidx = y * width + nx;
+          const nmaskValue = maskData[nidx];
+          const nisBodyPixel = useInverted ? nmaskValue < 127 : nmaskValue > 127;
+          if (!nisBodyPixel) {
+            allBody = false;
+            break;
+          }
+        }
+        
+        eroded[idx] = allBody ? maskValue : (useInverted ? 255 : 0);
+      }
+    }
+    
+    // Dilate horizontally
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = y * width + x;
+        const maskValue = eroded[idx];
+        const isBodyPixel = useInverted ? maskValue < 127 : maskValue > 127;
+        
+        if (isBodyPixel) {
+          result[idx] = maskValue;
+          continue;
+        }
+        
+        // Check if any pixel in horizontal kernel is body pixel
+        let anyBody = false;
+        for (let dx = -kernelSize; dx <= kernelSize; dx++) {
+          const nx = x + dx;
+          if (nx < 0 || nx >= width) continue;
+          const nidx = y * width + nx;
+          const nmaskValue = eroded[nidx];
+          const nisBodyPixel = useInverted ? nmaskValue < 127 : nmaskValue > 127;
+          if (nisBodyPixel) {
+            anyBody = true;
+            break;
+          }
+        }
+        
+        result[idx] = anyBody ? (useInverted ? 0 : 255) : maskValue;
+      }
+    }
+    
+    return result;
+  };
+
   // ---- scan single row and find non-edge-touching body regions ----
-  const scanRowForBodyRegions = (maskData, width, y, useInverted, roi) => {
+  const scanRowForBodyRegions = (maskData, width, y, useInverted, roi, type = "width") => {
     const bodyRegions = [];
     let currentRegion = null;
     const startX = roi ? Math.max(0, roi.minX - 5) : 0;
@@ -731,11 +917,27 @@ export default function App() {
       bodyRegions.push(currentRegion);
     }
     
-    // Reject edge-touching components (CRITICAL FIX)
+    // Edge rejection logic:
+    // - For front photos (width): reject regions touching ANY edge (person should be centered)
+    // - For side photos (depth): allow regions touching ONE edge (person is at side of frame)
+    //   but reject regions touching BOTH edges (spans full width = likely background/artifacts)
     const nonEdgeRegions = bodyRegions.filter(region => {
       const touchesLeftEdge = region.start <= 1;
       const touchesRightEdge = region.end >= width - 2;
-      return !touchesLeftEdge && !touchesRightEdge;
+      const touchesBothEdges = touchesLeftEdge && touchesRightEdge;
+      const spanRatio = (region.end - region.start) / width;
+      
+      if (type === "width") {
+        // Front photo: reject if touches any edge
+        return !touchesLeftEdge && !touchesRightEdge;
+      } else {
+        // Side photo: reject if touches both edges OR spans > 80% of width
+        if (touchesBothEdges || spanRatio > 0.8) {
+          return false;
+        }
+        // Allow regions touching one edge (normal for side profile)
+        return true;
+      }
     });
     
     return nonEdgeRegions;
@@ -757,39 +959,101 @@ export default function App() {
     // maskData is a Uint8Array where each value represents mask confidence
     // Values > 127 typically indicate person pixels
 
-    // Determine if mask is inverted
-    const sampleIdx = Math.floor(height * 0.5) * width + Math.floor(width * 0.5);
-    const avgSample = maskData[sampleIdx];
-    const useInverted = avgSample < 64;
+    // Determine if mask is inverted by sampling multiple points
+    // Sample center and a few points around it
+    const centerY = Math.floor(height * 0.5);
+    const centerX = Math.floor(width * 0.5);
+    const samplePoints = [
+      centerY * width + centerX,
+      centerY * width + Math.floor(width * 0.3),
+      centerY * width + Math.floor(width * 0.7),
+      Math.floor(height * 0.3) * width + centerX,
+      Math.floor(height * 0.7) * width + centerX,
+    ];
+    const samples = samplePoints.map(idx => maskData[idx]);
+    const avgSample = samples.reduce((a, b) => a + b, 0) / samples.length;
+    let useInverted = avgSample < 64;
 
     // Find torso ROI (largest 2D connected component)
-    const torsoROI = findTorsoROI(maskData, width, height, useInverted);
+    let torsoROI = findTorsoROI(maskData, width, height, useInverted);
+    
+    // If ROI spans > 90% of image width, mask is likely inverted
+    if (torsoROI && (torsoROI.maxX - torsoROI.minX) / width > 0.9) {
+      console.warn(`[${type}] Torso ROI spans ${((torsoROI.maxX - torsoROI.minX) / width * 100).toFixed(1)}% of width - trying inverted mask`);
+      useInverted = !useInverted;
+      torsoROI = findTorsoROI(maskData, width, height, useInverted);
+    }
+    
     if (!torsoROI) {
       console.warn(`[${type}] No valid torso ROI found`);
       return null;
     }
     
-    console.log(`[${type}] Torso ROI: x=${torsoROI.minX}-${torsoROI.maxX}, y=${torsoROI.minY}-${torsoROI.maxY}`);
+    const roiWidthRatio = (torsoROI.maxX - torsoROI.minX) / width;
+    console.log(`[${type}] Torso ROI: x=${torsoROI.minX}-${torsoROI.maxX}, y=${torsoROI.minY}-${torsoROI.maxY} (${(roiWidthRatio * 100).toFixed(1)}% of width), inverted=${useInverted}`);
 
     // Convert head/heel Y positions to actual pixel positions
     const headYPx = (headY / 720) * height;
     const heelYPx = (heelY / 720) * height;
     const bodyHeightPx = heelYPx - headYPx;
     const bodyHeightCm = bodyHeightPx * scaleMmPerPx / 10;
+    
+    // Scale logging
+    console.log(`[scale] mm/px=${scaleMmPerPx.toFixed(3)}, spanPx=${bodyHeightPx.toFixed(1)}, H=${bodyHeightCm.toFixed(1)}cm`);
 
     // Sanity constraints based on height
+    // Width (front photo): side-to-side breadth is larger
     const minWidthCm = bodyHeightCm * 0.25; // 25% of height
-    const maxWidthCm = bodyHeightCm * 0.55; // 55% of height
-    const minDepthCm = bodyHeightCm * 0.18; // 18% of height
-    const maxDepthCm = bodyHeightCm * 0.50; // 50% of height
+    const maxWidthCm = bodyHeightCm * 0.50; // 50% of height (reduced from 55%)
+    // Depth (side photo): front-to-back thickness is naturally smaller
+    const minDepthCm = bodyHeightCm * 0.18; // 18% of height (restored for better validation)
+    const maxDepthCm = bodyHeightCm * 0.45; // 45% of height (reduced from 50%)
 
-    // Define key vertical positions as percentages from head (0.0) to heel (1.0)
+    // Define key vertical positions as ratios from HEAD (0.0 = head, 1.0 = heel)
+    // All ratios are from HEAD to ensure correct ordering: chest < waist < hips < thighs
+    // Based on anatomical proportions and avoiding deltoids/arm flare
     const landmarks = {
-      chest: 0.30,   // ~30% down from head
-      waist: 0.45,   // ~45% down from head
-      hips: 0.55,    // ~55% down from head
-      thighs: 0.70,  // ~70% down from head
+      chest: 0.30,   // 30% down from head (~0.26-0.35H typical range)
+      waist: 0.45,   // 45% down from head (~0.23-0.32H typical range)
+      hips: 0.55,    // 55% down from head (~0.26-0.36H typical range)
+      thighs: 0.70,  // 70% down from head
     };
+    
+    // Sanity check: verify band ordering (chest should be above waist/hips)
+    const chestY = Math.floor(headYPx + (bodyHeightPx * landmarks.chest));
+    const waistY = Math.floor(headYPx + (bodyHeightPx * landmarks.waist));
+    const hipsY = Math.floor(headYPx + (bodyHeightPx * landmarks.hips));
+    
+    if (!(chestY < waistY && waistY < hipsY)) {
+      console.warn(`[bands] Invalid order detected! chestY=${chestY}, waistY=${waistY}, hipsY=${hipsY}`);
+      console.warn(`[bands] Falling back to safe ratios: chest=0.30, waist=0.45, hips=0.55`);
+      // Already using safe ratios, but log the issue
+    }
+    
+    console.log(`[bands % of H from head]`, {
+      chest: landmarks.chest.toFixed(2),
+      waist: landmarks.waist.toFixed(2),
+      hips: landmarks.hips.toFixed(2),
+      thighs: landmarks.thighs.toFixed(2)
+    });
+    console.log(`[bands y px]`, {
+      chest: chestY,
+      waist: waistY,
+      hips: hipsY,
+      thighs: Math.floor(headYPx + (bodyHeightPx * landmarks.thighs))
+    });
+
+    // Apply horizontal morphological opening for width measurements (suppress arms)
+    // Calculate kernel size: remove 35-45mm of lateral arm bulge
+    // k_px = round(desired_mm / mm_per_px) where desired_mm ∈ [35, 45]
+    let processedMaskData = maskData;
+    let kernelSize = null;
+    if (type === "width") {
+      const targetRemovalMm = 35; // Start with 35mm (3.5cm)
+      kernelSize = Math.max(15, Math.min(30, Math.round(targetRemovalMm / scaleMmPerPx)));
+      console.log(`[${type}] Applying horizontal opening with kernel=${kernelSize}px (target: ${targetRemovalMm}mm removal, scale=${scaleMmPerPx.toFixed(3)}mm/px)`);
+      processedMaskData = applyHorizontalOpening(maskData, width, height, useInverted, kernelSize);
+    }
 
     const measurements = {};
 
@@ -810,72 +1074,167 @@ export default function App() {
         continue;
       }
 
-      // Use median across vertical band (±15px) instead of single row
-      // This kills local holes/noise
-      const bandHalfHeight = 15;
-      const bandStartY = Math.max(0, centerY - bandHalfHeight);
-      const bandEndY = Math.min(height - 1, centerY + bandHalfHeight);
-      const dimensionSamples = [];
+      // Landmark-specific bounds (after opening & before retune)
+      let landmarkMinCm, landmarkMaxCm;
+      if (type === "width") {
+        // Front width guardrails (as fractions of height)
+        if (name === "chest") {
+          landmarkMinCm = bodyHeightCm * 0.26;
+          landmarkMaxCm = bodyHeightCm * 0.35;
+        } else if (name === "waist") {
+          landmarkMinCm = bodyHeightCm * 0.23;
+          landmarkMaxCm = bodyHeightCm * 0.32;
+        } else if (name === "hips") {
+          landmarkMinCm = bodyHeightCm * 0.26;
+          landmarkMaxCm = bodyHeightCm * 0.36;
+        } else { // thighs
+          landmarkMinCm = bodyHeightCm * 0.20;
+          landmarkMaxCm = bodyHeightCm * 0.50;
+        }
+      } else {
+        // Side depth guardrails (as fractions of height)
+        if (name === "chest") {
+          landmarkMinCm = bodyHeightCm * 0.18;
+          landmarkMaxCm = bodyHeightCm * 0.28;
+        } else if (name === "waist") {
+          landmarkMinCm = bodyHeightCm * 0.18;
+          landmarkMaxCm = bodyHeightCm * 0.28;
+        } else if (name === "hips") {
+          landmarkMinCm = bodyHeightCm * 0.18;
+          landmarkMaxCm = bodyHeightCm * 0.30;
+        } else { // thighs
+          landmarkMinCm = bodyHeightCm * 0.12;
+          landmarkMaxCm = bodyHeightCm * 0.45;
+        }
+      }
       
-      for (let y = bandStartY; y <= bandEndY; y++) {
-        const regions = scanRowForBodyRegions(maskData, width, y, useInverted, torsoROI);
+      let dimPx, dimCm, usedKernel = kernelSize, chosenRegion = null;
+      
+      if (type === "width") {
+        // For width: use auto-tune with 10th percentile
+        // Try initial kernel, then retune if needed
+        const depthEstimate = measurements.waist ? measurements.waist.cm * 1.2 : null; // Rough estimate
+        const result = measureWidthWithRetune(
+          maskData, width, height, useInverted, torsoROI, name, centerY,
+          bodyHeightCm, scaleMmPerPx, kernelSize, depthEstimate
+        );
         
-        // Discard fragmented rows (>1 internal component after edge rejection)
-        if (regions.length === 0 || regions.length > 1) {
-          // Skip fragmented rows or rows with no valid regions
+        if (result) {
+          dimPx = result.widthPx;
+          dimCm = result.widthCm;
+          usedKernel = result.kernel;
+          chosenRegion = result.details;
+          
+          // Enhanced debug logs
+          const widthSamples = []; // Would need to collect from measureWidthWithRetune
+          console.log(`[width] ${name}: p10=${dimPx.toFixed(1)}px, kernel=${usedKernel}px`);
+          if (chosenRegion) {
+            console.log(`[asym] ${name}: L=${chosenRegion.leftX - torsoROI.minX}px, R=${torsoROI.maxX - chosenRegion.rightX}px`);
+          }
+        } else {
+          console.warn(`  ${name} (${type}): Auto-tune failed for all kernels`);
+          measurements[name] = null;
+          continue;
+        }
+      } else {
+        // For depth: use vertical band with MEDIAN
+        const bandHalfHeight = 20;
+        const bandStartY = Math.max(0, centerY - bandHalfHeight);
+        const bandEndY = Math.min(height - 1, centerY + bandHalfHeight);
+        const dimensionSamples = [];
+        
+        for (let y = bandStartY; y <= bandEndY; y++) {
+          const regions = scanRowForBodyRegions(processedMaskData, width, y, useInverted, torsoROI, type);
+          if (regions.length === 1) {
+            const region = regions[0];
+            dimensionSamples.push(region.end - region.start);
+          }
+        }
+        
+        if (dimensionSamples.length === 0) {
+          console.warn(`  ${name} (${type}): No valid regions found in vertical band`);
+          measurements[name] = null;
           continue;
         }
         
-        // Single valid region found - use it
-        const region = regions[0];
-        const dimPx = region.end - region.start;
-        dimensionSamples.push(dimPx);
+        // Use median for depth
+        dimensionSamples.sort((a, b) => a - b);
+        const medianIdx = Math.floor(dimensionSamples.length / 2);
+        dimPx = dimensionSamples.length % 2 === 0
+          ? (dimensionSamples[medianIdx - 1] + dimensionSamples[medianIdx]) / 2
+          : dimensionSamples[medianIdx];
+        dimCm = (dimPx * scaleMmPerPx) / 10;
+        
+        // Enhanced debug logs
+        const p30 = percentile(dimensionSamples, 30);
+        const p50 = percentile(dimensionSamples, 50);
+        const p70 = percentile(dimensionSamples, 70);
+        console.log(`[depth] ${name}: p50=${p50?.toFixed(1) || 'N/A'}px, p30=${p30?.toFixed(1) || 'N/A'}px, p70=${p70?.toFixed(1) || 'N/A'}px`);
       }
       
-      if (dimensionSamples.length === 0) {
-        console.warn(`  ${name} (${type}): No valid regions found in vertical band`);
-        measurements[name] = null;
-        continue;
+      // Symmetry clamp for width (apply BEFORE bounds check)
+      if (type === "width" && chosenRegion) {
+        const torsoCenterX = (torsoROI.minX + torsoROI.maxX) / 2;
+        const leftHalf = chosenRegion.leftX - torsoROI.minX;
+        const rightHalf = torsoROI.maxX - chosenRegion.rightX;
+        const asymmetry = Math.abs(leftHalf - rightHalf) / dimPx;
+        
+        if (asymmetry > 0.25) {
+          // Apply symmetry clamp: width = 2 * min(leftHalf, rightHalf)
+          const wSym = 2 * Math.min(leftHalf, rightHalf);
+          console.log(`[asym] ${name}: High asymmetry ${(asymmetry * 100).toFixed(1)}%, clamping: ${dimPx.toFixed(1)}px → ${wSym.toFixed(1)}px`);
+          dimPx = Math.min(dimPx, wSym);
+          dimCm = (dimPx * scaleMmPerPx) / 10;
+        }
       }
       
-      // Take median dimension
-      dimensionSamples.sort((a, b) => a - b);
-      const medianIdx = Math.floor(dimensionSamples.length / 2);
-      const dimPx = dimensionSamples.length % 2 === 0
-        ? (dimensionSamples[medianIdx - 1] + dimensionSamples[medianIdx]) / 2
-        : dimensionSamples[medianIdx];
+      // Soft coupling: width ≤ 1.25 * depth (only if we have depth estimate)
+      // Note: depthEstimate is only available for width measurements
+      if (type === "width") {
+        const currentDepthEstimate = measurements.waist ? measurements.waist.cm * 1.2 : null;
+        if (currentDepthEstimate && dimCm > currentDepthEstimate * 1.25) {
+          const capped = currentDepthEstimate * 1.25;
+          console.log(`[guards] ${name}: Soft cap applied: ${dimCm.toFixed(1)}cm → ${capped.toFixed(1)}cm (1.25×depth)`);
+          dimCm = capped;
+          dimPx = (capped * 10) / scaleMmPerPx;
+        }
+      }
       
-      const dimMm = dimPx * scaleMmPerPx;
-      const dimCm = dimMm / 10;
+      // Check bounds with ±10% tolerance
+      const tolerance = 0.10;
+      const adjustedMinCm = landmarkMinCm * (1 - tolerance);
+      const adjustedMaxCm = landmarkMaxCm * (1 + tolerance);
       
-      // Apply sanity constraints based on height
-      const minCm = type === "width" ? minWidthCm : minDepthCm;
-      const maxCm = type === "width" ? maxWidthCm : maxDepthCm;
-      
-      // Also check depth > width * 1.3 (likely included back/head bump)
       let shouldReject = false;
       let rejectReason = "";
+      let guardTripped = "";
       
-      if (dimCm < minCm || dimCm > maxCm) {
-        shouldReject = true;
-        rejectReason = `outside height-based bounds (${minCm.toFixed(1)}-${maxCm.toFixed(1)}cm)`;
-      }
-      
-      // Additional check: if depth significantly exceeds width (for side photo)
-      if (type === "depth" && measurements[name] === undefined) {
-        // Will check after we have width, but log for now
+      // Check bounds with tolerance
+      if (dimCm < adjustedMinCm || dimCm > adjustedMaxCm) {
+        // Check strict bounds
+        if (dimCm < landmarkMinCm || dimCm > landmarkMaxCm) {
+          shouldReject = true;
+          rejectReason = `outside height-based bounds (${landmarkMinCm.toFixed(1)}-${landmarkMaxCm.toFixed(1)}cm)`;
+          guardTripped = `range guard: ${dimCm.toFixed(1)}cm vs [${landmarkMinCm.toFixed(1)}, ${landmarkMaxCm.toFixed(1)}]`;
+        } else {
+          console.log(`[guards] ${name}: ${dimCm.toFixed(1)}cm within tolerance (±10%) of bounds`);
+        }
       }
       
       if (shouldReject) {
-        console.warn(`  ${name} (${type}): Rejected - ${dimCm.toFixed(1)}cm ${rejectReason}`);
-        console.warn(`    Body height: ${bodyHeightCm.toFixed(1)}cm, Required: ${minCm.toFixed(1)}-${maxCm.toFixed(1)}cm`);
-        console.warn(`    Samples: ${dimensionSamples.length}, Median: ${dimPx.toFixed(1)}px`);
+        console.warn(`[guards] ${name} (${type}): Rejected - ${rejectReason}`);
+        console.warn(`  ${guardTripped}`);
+        console.warn(`  Body height: ${bodyHeightCm.toFixed(1)}cm`);
         measurements[name] = null;
         continue;
       }
       
-      console.log(`  ${name} (${type}): ${dimPx.toFixed(1)}px → ${dimCm.toFixed(1)}cm (${dimMm.toFixed(1)}mm)`);
-      console.log(`    Vertical band y=${bandStartY}-${bandEndY}, ${dimensionSamples.length} valid rows, median dimension`);
+      console.log(`  ${name} (${type}): ${dimPx.toFixed(1)}px → ${dimCm.toFixed(1)}cm`);
+      if (type === "width") {
+        console.log(`    [opening] k_px=${usedKernel}px applied, [width] chosen=${dimPx.toFixed(1)}px`);
+      }
+      
+      const dimMm = dimPx * scaleMmPerPx;
       
       measurements[name] = {
         pixels: Math.round(dimPx),

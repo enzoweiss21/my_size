@@ -1367,10 +1367,17 @@ export default function App() {
 
         if (photoType === "front") {
           setFrontImageData(dataUrl);
-          setManualCaptureState("front-dots");
-          setActiveDot("left");
+          // Keep in calibration state if currently calibrating, otherwise move to dot placement
+          if (manualCaptureState === "calibration") {
+            // Stay in calibration to allow adjusting lines and locking scale
+          } else {
+            setManualCaptureState("front-dots");
+            setActiveDot("left");
+          }
         } else if (photoType === "side") {
           setSideImageData(dataUrl);
+          // Transition to side-dots when uploading side photo
+          // Scale should already be locked from front calibration
           setManualCaptureState("side-dots");
           setActiveDot("front");
         }
@@ -1497,8 +1504,14 @@ export default function App() {
       const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
       setCapturedDataUrl(dataUrl);
       setFrontImageData(dataUrl);
-      setManualCaptureState("front-dots");
-      setActiveDot("left");
+      // Keep in calibration state to allow adjusting lines and locking scale
+      // State will transition to front-dots when user clicks "Start Placing Dots" button
+      if (manualCaptureState === "calibration") {
+        // Stay in calibration state
+      } else {
+        setManualCaptureState("front-dots");
+        setActiveDot("left");
+      }
     });
   };
 
@@ -1845,6 +1858,17 @@ export default function App() {
                   Retake Photo
                 </button>
               )}
+              {capturedDataUrl && scaleMmPerPx && (
+                <button 
+                  onClick={() => {
+                    setManualCaptureState("front-dots");
+                    setActiveDot("left");
+                  }}
+                  style={{background:"#10b981", color:"white", fontWeight:"bold"}}
+                >
+                  Start Placing Dots
+                </button>
+              )}
               {!scaleMmPerPx && (
                 <span style={{opacity: 0.7, fontSize: 12, marginLeft: 8}}>
                   ⚠️ Lock scale before placing dots to measure
@@ -1858,8 +1882,9 @@ export default function App() {
                 setManualCaptureState("calibration");
                 setActiveDot(null);
                 setManualDots(prev => ({ ...prev, front: { left: null, right: null } }));
+                // Keep the captured photo so user can see calibration lines
               }}>
-                Retake Front
+                Back to Calibration
               </button>
               <button 
                 onClick={() => {

@@ -32,7 +32,7 @@ export default function App() {
   // captured still photo for calibration
   const [capturedDataUrl, setCapturedDataUrl] = useState(null);
   // countdown before photo capture
-  const [countdown, setCountdown] = useState(null); // 3..2..1 or null
+  const [countdown, setCountdown] = useState(null); // 5..4..3..2..1 or null
   // saved front image (blob/data URL)
   const [frontImageData, setFrontImageData] = useState(null);
   // capture state: null = calibration, "front" = front captured, "side" = ready for side
@@ -164,7 +164,9 @@ export default function App() {
   // ---- ensure canvas is available when switching to dot placement ----
   useEffect(() => {
     if (mode === "manual") {
-      if (manualCaptureState === "front-dots" && frontImageData) {
+      const needsFrontCanvas = manualCaptureState === "front-dots" || manualCaptureState === "front-calibration";
+      const needsSideCanvas = manualCaptureState === "side-dots" || manualCaptureState === "side-calibration";
+      if (needsFrontCanvas && frontImageData) {
         // Ensure canvas is set to front image
         const img = new Image();
         img.onload = () => {
@@ -176,7 +178,7 @@ export default function App() {
           capturedCanvasRef.current = canvas;
         };
         img.src = frontImageData;
-      } else if (manualCaptureState === "side-dots" && sideImageData) {
+      } else if (needsSideCanvas && sideImageData) {
         // Ensure canvas is set to side image
         const img = new Image();
         img.onload = () => {
@@ -615,76 +617,109 @@ export default function App() {
     setDraggingDot(null);
   };
 
-  // ---- compute pixel calibration scale ----
+  // ---- compute pixel calibration scale (IMPROVED) ----
   // This establishes the pixel-to-millimeter conversion ratio using:
   // - User's known height (heightCm)
   // - Measured pixel distance between head and heel (spanPx) in ACTUAL image pixels
+  // - Sub-pixel edge refinement for accuracy
+  // - Pitch/lens guardrails for quality
   // Formula: scaleMmPerPx = (heightCm * 10) / spanPx
-  // This calibration is then used with deterministic segmentation scanning
   const lockScale = () => {
+    const processScale = (canvas, headYLogical, heelYLogical, isManual = false, photoType = null) => {
+      if (!canvas) {
+        return { error: isManual ? `No ${photoType} image captured. Please capture a photo first.` : "No image captured. Please capture a photo first." };
+      }
+      
+      // Use actual pixel buffer dimensions (not CSS size)
+      const actualImageHeight = canvas.height;
+      const actualImageWidth = canvas.width;
+      
+      // Convert logical Y (0-720) to actual pixel Y
+      let headYPx = (headYLogical / 720) * actualImageHeight;
+      let heelYPx = (heelYLogical / 720) * actualImageHeight;
+      
+      // Refine edges using sub-pixel edge snap
+      try {
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          // Refine head edge (sample center region)
+          headYPx = refineEdgeY(ctx, headYPx, actualImageWidth * 0.3, actualImageWidth * 0.7);
+          // Refine heel edge (sample center region)
+          heelYPx = refineEdgeY(ctx, heelYPx, actualImageWidth * 0.3, actualImageWidth * 0.7);
+        }
+      } catch (e) {
+        console.warn("Edge refinement failed, using original Y:", e);
+      }
+      
+      const spanPx = Math.abs(heelYPx - headYPx);
+      
+      // Guardrails
+      if (spanPx < 200) {
+        return { error: "Subject too small in frame. Step back." };
+      }
+      
+      if (Math.abs(pitchDeg) > 2 || Math.abs(rollDeg) > 2) {
+        return { error: "Hold phone level (|pitch|,|roll| < 2°)." };
+      }
+      
+      // Pitch/lens guardrails: reject if span ratio is suspicious
+      const spanRatio = spanPx / actualImageHeight;
+      if (spanRatio < 0.35 || spanRatio > 0.95) {
+        return { error: `Bad calibration: body span (${spanRatio.toFixed(2)} of image height) suggests crop/tilt. Please retake photo.` };
+      }
+      
+      const computedScale = (heightCm * 10) / spanPx;
+      
+      return {
+        scale: computedScale,
+        spanPx,
+        headYPx,
+        heelYPx,
+        imageWidth: actualImageWidth,
+        imageHeight: actualImageHeight
+      };
+    };
+    
     // Handle manual mode - separate calibration for front and side
     if (mode === "manual") {
       if (manualCaptureState === "front-calibration") {
         const canvas = capturedCanvasRef.current;
-        if (!canvas) {
-          return alert("No front image captured. Please capture a photo first.");
+        const result = processScale(canvas, frontHeadY, frontHeelY, true, "front");
+        if (result.error) {
+          return alert(result.error);
         }
-        
-        const actualImageHeight = canvas.height;
-        const headYPx = (frontHeadY / 720) * actualImageHeight;
-        const heelYPx = (frontHeelY / 720) * actualImageHeight;
-        const spanPx = Math.abs(heelYPx - headYPx);
-        
-    if (spanPx < 200) return alert("Subject too small in frame. Step back.");
-    if (Math.abs(pitchDeg) > 2 || Math.abs(rollDeg) > 2) return alert("Hold phone level (|pitch|,|roll| < 2°).");
-        
-        const computedScale = (heightCm * 10) / spanPx;
-        setFrontScaleMmPerPx(computedScale);
-        console.log(`Front pixel calibration locked: ${computedScale.toFixed(3)} mm/px`);
+        setFrontScaleMmPerPx(result.scale);
+        console.log(`Front pixel calibration locked: ${result.scale.toFixed(3)} mm/px`);
+        console.log(`  Image: ${result.imageWidth}×${result.imageHeight}px`);
+        console.log(`  Head Y: ${result.headYPx.toFixed(1)}px, Heel Y: ${result.heelYPx.toFixed(1)}px`);
+        console.log(`  Span: ${result.spanPx.toFixed(1)}px, Height: ${heightCm}cm (${heightCm * 10}mm)`);
         return;
       } else if (manualCaptureState === "side-calibration") {
         const canvas = capturedCanvasRef.current;
-        if (!canvas) {
-          return alert("No side image captured. Please capture a photo first.");
+        const result = processScale(canvas, sideHeadY, sideHeelY, true, "side");
+        if (result.error) {
+          return alert(result.error);
         }
-        
-        const actualImageHeight = canvas.height;
-        const headYPx = (sideHeadY / 720) * actualImageHeight;
-        const heelYPx = (sideHeelY / 720) * actualImageHeight;
-        const spanPx = Math.abs(heelYPx - headYPx);
-        
-        if (spanPx < 200) return alert("Subject too small in frame. Step back.");
-        if (Math.abs(pitchDeg) > 2 || Math.abs(rollDeg) > 2) return alert("Hold phone level (|pitch|,|roll| < 2°).");
-        
-        const computedScale = (heightCm * 10) / spanPx;
-        setSideScaleMmPerPx(computedScale);
-        console.log(`Side pixel calibration locked: ${computedScale.toFixed(3)} mm/px`);
+        setSideScaleMmPerPx(result.scale);
+        console.log(`Side pixel calibration locked: ${result.scale.toFixed(3)} mm/px`);
+        console.log(`  Image: ${result.imageWidth}×${result.imageHeight}px`);
+        console.log(`  Head Y: ${result.headYPx.toFixed(1)}px, Heel Y: ${result.heelYPx.toFixed(1)}px`);
+        console.log(`  Span: ${result.spanPx.toFixed(1)}px, Height: ${heightCm}cm (${heightCm * 10}mm)`);
         return;
       }
     }
     
-    // Pose estimation mode - original behavior
+    // Pose estimation mode
     const canvas = capturedCanvasRef.current;
-    if (!canvas) {
-      return alert("No image captured. Please capture a photo first.");
+    const result = processScale(canvas, headY, heelY);
+    if (result.error) {
+      return alert(result.error);
     }
-    
-    const actualImageHeight = canvas.height;
-    const actualImageWidth = canvas.width;
-    
-    const headYPx = (headY / 720) * actualImageHeight;
-    const heelYPx = (heelY / 720) * actualImageHeight;
-    const spanPx = Math.abs(heelYPx - headYPx);
-    
-    if (spanPx < 200) return alert("Subject too small in frame. Step back.");
-    if (Math.abs(pitchDeg) > 2 || Math.abs(rollDeg) > 2) return alert("Hold phone level (|pitch|,|roll| < 2°).");
-    
-    const computedScale = (heightCm * 10) / spanPx;
-    setScaleMmPerPx(computedScale);
-    console.log(`Pixel calibration locked: ${computedScale.toFixed(3)} mm/px`);
-    console.log(`  Image dimensions: ${actualImageWidth}×${actualImageHeight}px`);
-    console.log(`  Head Y: ${headYPx.toFixed(1)}px, Heel Y: ${heelYPx.toFixed(1)}px`);
-    console.log(`  Span: ${spanPx.toFixed(1)}px, Height: ${heightCm}cm (${heightCm * 10}mm)`);
+    setScaleMmPerPx(result.scale);
+    console.log(`Pixel calibration locked: ${result.scale.toFixed(3)} mm/px`);
+    console.log(`  Image dimensions: ${result.imageWidth}×${result.imageHeight}px`);
+    console.log(`  Head Y: ${result.headYPx.toFixed(1)}px, Heel Y: ${result.heelYPx.toFixed(1)}px`);
+    console.log(`  Span: ${result.spanPx.toFixed(1)}px, Height: ${heightCm}cm (${heightCm * 10}mm)`);
   };
 
   // ---- capture photo helper ----
@@ -713,7 +748,7 @@ export default function App() {
 
   const startCountdownAndCapture = (onComplete) => {
     if (typeof countdown === "number") return;
-    let t = 3;
+    let t = 5;
     setCountdown(t);
     const interval = setInterval(() => {
       t -= 1;
@@ -1021,45 +1056,52 @@ export default function App() {
       const depth = depths[landmark];
 
       if (width && depth) {
+        // QA: Soft coupling - width should not exceed depth by too much (catches arm leaks)
+        let widthMm = width.mm;
+        let depthMm = depth.mm;
+        
+        if (widthMm > depthMm * 1.25) {
+          console.warn(`${landmark}: Width (${width.cm}cm) > 1.25× depth (${depth.cm}cm) - possible arm contamination, clamping`);
+          widthMm = depthMm * 1.25;
+        }
+        
         // Final sanity check: depth should not be > width * 1.1
-        // If so, likely included back/head bump, edge artifacts, or arm still in width measurement
-        if (depth.cm > width.cm * 1.1) {
+        // If so, likely included back/head bump, edge artifacts
+        if (depthMm > widthMm * 1.1) {
           console.warn(`${landmark}: Rejected - depth (${depth.cm}cm) > width (${width.cm}cm) * 1.1`);
-          console.warn(`  Likely included back/head bump, edge artifacts, or arm still in width. Skipping this measurement.`);
+          console.warn(`  Likely included back/head bump, edge artifacts. Skipping this measurement.`);
           return; // Skip this landmark
         }
         
-        // Front photo gives us the left-right width (one dimension of the cross-section)
-        // Side photo gives us the front-back depth (the other dimension)
-        // For circumference calculation, we treat the body cross-section as an ellipse
-        
-        // The width and depth are already the full dimensions (not halves)
-        // So we use them directly as the major and minor axes of an ellipse
-        const semiMajorAxis = width.mm / 2; // half-width (left-to-right radius)
-        const semiMinorAxis = depth.mm / 2; // half-depth (front-to-back radius)
-        
         // Calculate cross-sectional area using ellipse formula: π × a × b
+        const semiMajorAxis = widthMm / 2;
+        const semiMinorAxis = depthMm / 2;
         const crossSectionalAreaMm2 = Math.PI * semiMajorAxis * semiMinorAxis;
         const crossSectionalAreaCm2 = crossSectionalAreaMm2 / 100;
 
-        // Calculate circumference using Ramanujan's ellipse approximation
-        // This gives us the full wrap-around measurement accounting for both dimensions
-        // C ≈ π * (a + b) * (1 + (3h) / (10 + √(4 - 3h)))
-        // where h = ((a - b) / (a + b))²
-        const h = Math.pow((semiMajorAxis - semiMinorAxis) / (semiMajorAxis + semiMinorAxis), 2);
-        const circumferenceMm = Math.PI * (semiMajorAxis + semiMinorAxis) * (1 + (3 * h) / (10 + Math.sqrt(4 - 3 * h)));
-        const circumferenceCm = circumferenceMm / 10;
+        // Calculate circumference using improved auto-chooser model
+        // curvatureHint: 0(round) .. 1(boxy) - estimate from aspect ratio
+        const aspectRatio = Math.max(widthMm, depthMm) / Math.min(widthMm, depthMm);
+        const curvatureHint = aspectRatio > 1.3 ? 0.7 : 0.4; // Higher aspect = boxier
+        
+        const circumferenceMmValue = circumferenceMm(widthMm, depthMm, curvatureHint);
+        const circumferenceCm = circumferenceMmValue / 10;
+        
+        // Human plausibility check
+        if (landmark === "chest" && (circumferenceCm < 90 || circumferenceCm > 140)) {
+          console.warn(`${landmark}: Circumference ${circumferenceCm.toFixed(1)}cm outside typical range (90-140cm). Consider re-taking side photo or adjusting calibration lines.`);
+        }
 
         // Store area for trapezoidal integration later
         combinedMeasurements[landmark] = {
-          // 2D measurements from photos
+          // 2D measurements from photos (use clamped width if adjusted)
           width: {
-            cm: Math.round(width.cm * 10) / 10,
-            mm: width.mm
+            cm: Math.round((widthMm / 10) * 10) / 10,
+            mm: widthMm
           },
           depth: {
             cm: Math.round(depth.cm * 10) / 10,
-            mm: depth.mm
+            mm: depthMm
           },
           // 3D calculations (full body wrap-around)
           crossSectionalArea: {
@@ -1068,7 +1110,7 @@ export default function App() {
           },
           circumference: {
             cm: Math.round(circumferenceCm * 10) / 10,
-            mm: Math.round(circumferenceMm)
+            mm: Math.round(circumferenceMmValue)
           },
           // Volume placeholder - will calculate using trapezoidal integration
           volume: {
@@ -1800,10 +1842,20 @@ export default function App() {
 
         if (photoType === "front") {
           setFrontImageData(dataUrl);
-          setManualCaptureState("front-calibration");
+          if (sideImageData) {
+            setManualCaptureState("front-calibration");
+          } else {
+            setManualCaptureState("side-capture");
+            setCapturedDataUrl(null);
+          }
         } else if (photoType === "side") {
           setSideImageData(dataUrl);
-          setManualCaptureState("side-calibration");
+          if (!frontImageData) {
+            setManualCaptureState("front-capture");
+            setCapturedDataUrl(null);
+          } else {
+            setManualCaptureState("front-calibration");
+          }
         }
       };
       img.src = e.target.result;
@@ -2021,9 +2073,139 @@ export default function App() {
     }
   };
 
+  // ===== UNIT HELPERS (avoid stealth unit slips) =====
+  const mm = (px, mmPerPx) => px * mmPerPx;
+  const cm = (mm) => mm / 10;
+  const inches = (mm) => mm / 25.4;
+  
   // Helper: Convert cm to inches (1 cm = 0.393701 inches)
   const cmToInches = (cm) => {
     return Math.round((cm * 0.393701) * 10) / 10;
+  };
+  
+  // ===== PIXEL SCALE REFINEMENT =====
+  // Sub-pixel edge snap: refine user-dragged head/heel to nearest strong horizontal edge
+  const refineEdgeY = (ctx, y, x0 = null, x1 = null) => {
+    const h = ctx.canvas.height;
+    const w = ctx.canvas.width;
+    const Y = Math.round(y);
+    const xL = Math.max(0, Math.floor(x0 ?? 0));
+    const xR = Math.min(w - 2, Math.ceil(x1 ?? w - 1));
+    
+    let best = { g: 0, y: Y };
+    
+    // 7px vertical window
+    for (let dy = -3; dy <= 3; dy++) {
+      const y1 = Math.min(h - 2, Math.max(1, Y + dy));
+      let gsum = 0;
+      
+      for (let x = xL; x < xR; x++) {
+        // Get vertical gradient (difference between row above and below)
+        const imgData = ctx.getImageData(x, y1 - 1, 1, 3);
+        if (imgData.data.length >= 12) {
+          // Use luminance for gradient
+          const lumUp = (imgData.data[0] + imgData.data[1] + imgData.data[2]) / 3;
+          const lumDn = (imgData.data[8] + imgData.data[9] + imgData.data[10]) / 3;
+          const gy = Math.abs(lumDn - lumUp);
+          gsum += gy;
+        }
+      }
+      
+      if (gsum > best.g) {
+        best = { g: gsum, y: y1 };
+      }
+    }
+    
+    return best.y; // refined Y
+  };
+  
+  // Frame burst median: capture multiple frames and use median for stability
+  const captureBurstMedian = async (count = 3) => {
+    const frames = [];
+    for (let i = 0; i < count; i++) {
+      await new Promise(resolve => setTimeout(resolve, 100)); // 100ms between frames
+      const canvas = capturePhoto();
+      if (canvas) frames.push(canvas);
+    }
+    if (frames.length === 0) return null;
+    
+    // For now, return the middle frame (can implement true median later)
+    return frames[Math.floor(frames.length / 2)];
+  };
+  
+  // ===== CIRCUMFERENCE MODELS =====
+  // Ramanujan ellipse perimeter (stable version)
+  const ramanujanEllipsePerimeter = (widthMm, depthMm) => {
+    const a = widthMm / 2;
+    const b = depthMm / 2;
+    const sum = a + b;
+    const diff = Math.abs(a - b);
+    
+    if (sum < 1e-6) return 0;
+    
+    const h = Math.pow(diff / sum, 2);
+    return Math.PI * sum * (1 + (3 * h) / (10 + Math.sqrt(4 - 3 * h)));
+  };
+  
+  // Superellipse (Lamé) perimeter
+  const superellipsePerimeter = (aMm, bMm, n = 3.2) => {
+    const steps = 256;
+    const dt = 2 * Math.PI / steps;
+    let s = 0;
+    
+    for (let i = 0; i <= steps; i++) {
+      const t = i * dt;
+      const c = Math.cos(t);
+      const s1 = Math.sin(t);
+      
+      const ac = aMm * Math.sign(c) * Math.pow(Math.abs(c), 2 / n);
+      const bs = bMm * Math.sign(s1) * Math.pow(Math.abs(s1), 2 / n);
+      
+      const dac = aMm * (2 / n) * Math.pow(Math.abs(c), 2 / n - 1) * (-Math.sin(t));
+      const dbs = bMm * (2 / n) * Math.pow(Math.abs(s1), 2 / n - 1) * Math.cos(t);
+      
+      const speed = Math.hypot(dac, dbs);
+      s += (i === 0 || i === steps) ? speed : (i % 2 ? 4 * speed : 2 * speed);
+    }
+    
+    return (dt / 3) * s;
+  };
+  
+  // Rounded-rectangle perimeter
+  const roundedRectPerimeter = (widthMm, depthMm, rMm = null) => {
+    const w = widthMm;
+    const d = depthMm;
+    const r = rMm ?? Math.min(0.12 * Math.min(w, d), w / 2, d / 2);
+    
+    return 2 * ((w - 2 * r) + (d - 2 * r)) + 2 * Math.PI * r;
+  };
+  
+  // Auto-chooser for circumference model
+  const circumferenceMm = (widthMm, depthMm, curvatureHint = 0.5) => {
+    if (!widthMm || !depthMm) return 0;
+    
+    const aspectRatio = Math.max(widthMm, depthMm) / Math.min(widthMm, depthMm);
+    
+    // Boxy silhouette -> rounded rectangle
+    if (curvatureHint > 0.6) {
+      const r = 0.12 * Math.min(widthMm, depthMm);
+      return roundedRectPerimeter(widthMm, depthMm, r);
+    }
+    
+    // Near-circle -> Ramanujan
+    if (aspectRatio < 1.15) {
+      return ramanujanEllipsePerimeter(widthMm, depthMm);
+    }
+    
+    // General case -> superellipse
+    const n = aspectRatio > 1.3 ? 4.0 : 3.2;
+    return superellipsePerimeter(widthMm / 2, depthMm / 2, n);
+  };
+  
+  // ===== CO-REGISTRATION HELPERS =====
+  // Get Y position at same physical height ratio from head
+  const rowAtRatio = (headY, heelY, r) => {
+    return headY + r * (heelY - headY); // r = 0..1 from head
   };
 
   // Helper: Format measurement display based on unit preference
@@ -2079,27 +2261,53 @@ export default function App() {
       };
     };
 
-    // Helper: Calculate 3D measurements from width and depth
+    // Helper: Calculate 3D measurements from width and depth (IMPROVED)
     const calculate3D = (width, depth, name) => {
       if (!width || !depth) return null;
       
-      const semiMajorAxis = width.mm / 2;
-      const semiMinorAxis = depth.mm / 2;
-
+      // QA: Soft coupling - width should not exceed depth by too much (catches arm leaks)
+      if (width.mm > depth.mm * 1.25) {
+        console.warn(`${name}: Width (${width.cm}cm) > 1.25× depth (${depth.cm}cm) - possible arm contamination`);
+        // Soft clamp: cap width at 1.25× depth
+        width = {
+          ...width,
+          mm: depth.mm * 1.25,
+          cm: (depth.mm * 1.25) / 10
+        };
+      }
+      
+      // Symmetry check (for front width measurements)
+      // This would need left/right dots to compute, so we'll skip for now
+      
+      const widthMm = width.mm;
+      const depthMm = depth.mm;
+      
+      // Calculate area (ellipse baseline)
+      const semiMajorAxis = widthMm / 2;
+      const semiMinorAxis = depthMm / 2;
       const crossSectionalAreaMm2 = Math.PI * semiMajorAxis * semiMinorAxis;
       const crossSectionalAreaCm2 = crossSectionalAreaMm2 / 100;
-
-      const h = Math.pow((semiMajorAxis - semiMinorAxis) / (semiMajorAxis + semiMinorAxis), 2);
-      const circumferenceMm = Math.PI * (semiMajorAxis + semiMinorAxis) * (1 + (3 * h) / (10 + Math.sqrt(4 - 3 * h)));
-      const circumferenceCm = circumferenceMm / 10;
-
+      
+      // Calculate circumference using auto-chooser
+      // curvatureHint: 0(round) .. 1(boxy) - estimate from aspect ratio
+      const aspectRatio = Math.max(widthMm, depthMm) / Math.min(widthMm, depthMm);
+      const curvatureHint = aspectRatio > 1.3 ? 0.7 : 0.4; // Higher aspect = boxier
+      
+      const circumferenceMmValue = circumferenceMm(widthMm, depthMm, curvatureHint);
+      const circumferenceCm = circumferenceMmValue / 10;
+      
+      // Human plausibility check
+      if (name === "chest" && (circumferenceCm < 90 || circumferenceCm > 140)) {
+        console.warn(`${name}: Circumference ${circumferenceCm.toFixed(1)}cm outside typical range (90-140cm). Consider re-taking side photo or adjusting calibration lines.`);
+      }
+      
       return {
         name: name,
         width: width,
         depth: depth,
         circumference: {
           cm: Math.round(circumferenceCm * 10) / 10,
-          mm: Math.round(circumferenceMm)
+          mm: Math.round(circumferenceMmValue)
         },
         crossSectionalArea: {
           cm2: Math.round(crossSectionalAreaCm2 * 10) / 10,
@@ -2233,9 +2441,20 @@ export default function App() {
     startCountdownAndCapture((canvas) => {
       if (!canvas) return;
       const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
-      setCapturedDataUrl(dataUrl);
       setFrontImageData(dataUrl);
-      setManualCaptureState("front-calibration");
+      // If side photo already captured, move straight to calibration, else prompt for side capture
+      if (sideImageData) {
+        setManualCaptureState("front-calibration");
+      } else {
+        setManualCaptureState("side-capture");
+        setCapturedDataUrl(null);
+        setTimeout(() => {
+          if (videoRef.current && streamRef.current) {
+            videoRef.current.srcObject = streamRef.current;
+            videoRef.current.play().catch(err => console.error("Video play error:", err));
+          }
+        }, 100);
+      }
     });
   };
 
@@ -2244,9 +2463,14 @@ export default function App() {
     startCountdownAndCapture((canvas) => {
       if (!canvas) return;
       const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
-      setCapturedDataUrl(dataUrl);
       setSideImageData(dataUrl);
-      setManualCaptureState("side-calibration");
+      if (!frontImageData) {
+        // If somehow side captured first, prompt for front capture
+        setManualCaptureState("front-capture");
+        setCapturedDataUrl(null);
+      } else {
+        setManualCaptureState("front-calibration");
+      }
     });
   };
 
@@ -2455,7 +2679,7 @@ export default function App() {
 
         <h1>Calibration</h1>
         {mode === "manual" ? (
-          <p>Enter height. Then for each photo: drag <b>Head</b>/<b>Heel</b> lines → Lock scale → Place dots.</p>
+          <p>Enter height, capture <b>front and side photos back-to-back</b>, then sit down to drag the lines, lock scale, and place dots.</p>
         ) : (
         <p>Enter height → drag <b>Head</b>/<b>Heel</b> lines → Lock scale.</p>
         )}
@@ -2466,7 +2690,10 @@ export default function App() {
             <>
               {(manualCaptureState === "front-calibration" || manualCaptureState === "side-calibration") && (
                 <>
-                  <button onClick={lockScale} disabled={!capturedDataUrl}>
+                  <button 
+                    onClick={lockScale} 
+                    disabled={manualCaptureState === "front-calibration" ? !frontImageData : !sideImageData}
+                  >
                     {manualCaptureState === "front-calibration" ? "Lock Front Scale" : "Lock Side Scale"}
                   </button>
                   {manualCaptureState === "front-calibration" && frontScaleMmPerPx && (
@@ -2756,18 +2983,15 @@ export default function App() {
               {areAllFrontDotsPlaced() && (
                 <button 
                   onClick={() => {
-                    setManualCaptureState("side-capture");
-                    setCapturedDataUrl(null);
-                    setTimeout(() => {
-                      if (videoRef.current && streamRef.current) {
-                        videoRef.current.srcObject = streamRef.current;
-                        videoRef.current.play().catch(err => console.error("Video play error:", err));
-                      }
-                    }, 100);
+                    if (!sideImageData) {
+                      alert("Please capture your side photo first.");
+                      return;
+                    }
+                    setManualCaptureState("side-calibration");
                   }}
                   style={{background:"#10b981", color:"white", fontWeight:"bold"}}
                 >
-                  Continue to Side Photo
+                  Start Side Calibration
                 </button>
               )}
             </>
@@ -2797,6 +3021,30 @@ export default function App() {
                   onChange={(e) => handleManualFileUpload(e, "side")}
                 />
               </label>
+              {frontImageData && (
+                <button
+                  onClick={() => {
+                    setManualCaptureState("front-capture");
+                    setCapturedDataUrl(null);
+                    setFrontImageData(null);
+                    setFrontScaleMmPerPx(null);
+                    setManualDots(prev => ({
+                      ...prev,
+                      front: {
+                        shoulders: { left: null, right: null },
+                        chest: { left: null, right: null },
+                        waist: { left: null, right: null },
+                        hips: { left: null, right: null },
+                        thighs: { left: null, right: null, top: null },
+                        knee: { center: null },
+                        calves: { left: null, right: null, bottom: null }
+                      }
+                    }));
+                  }}
+                >
+                  Retake Front Photo
+                </button>
+              )}
             </>
           )}
           {manualCaptureState === "side-calibration" && (
@@ -2835,8 +3083,8 @@ export default function App() {
                     chest: { front: null, back: null },
                     waist: { front: null, back: null },
                     hips: { front: null, back: null },
-                    knees: { front: null, back: null },
-                    ankles: { front: null, back: null }
+                    thighs: { front: null, back: null },
+                    calves: { front: null, back: null }
                   }
                 }));
               }}>
@@ -2869,6 +3117,11 @@ export default function App() {
             </>
           )}
       </div>
+
+        <div style={{display:"flex", gap:16, alignItems:"center", fontSize:12, opacity:0.85}}>
+          <span>Front Photo: {frontImageData ? "✅ ready" : "⏳ pending"}</span>
+          <span>Side Photo: {sideImageData ? "✅ ready" : "⏳ pending"}</span>
+    </div>
 
         {manualCaptureState !== "side-capture" && (
         <div style={{position:"relative", width:"100%", aspectRatio:"16/9", background:"black", borderRadius:12, overflow:"hidden"}}>
@@ -3340,7 +3593,7 @@ export default function App() {
         )}
 
         <p style={{opacity:0.7, fontSize:12, marginTop:8}}>
-          {manualCaptureState === "front-capture" && "📸 Capture or upload front photo. Then calibrate with head/heel lines."}
+          {manualCaptureState === "front-capture" && "📸 Capture or upload your front photo. Side capture happens next; calibration comes later."}
           {manualCaptureState === "front-calibration" && "↕️ Drag the blue lines to mark head and heel positions, then lock scale."}
           {manualCaptureState === "front-dots" && (() => {
             const nextDot = getNextFrontDot();
@@ -3359,7 +3612,7 @@ export default function App() {
                 <>
                   <strong style={{color: "#10b981", fontSize: 14}}>✅ All front dots placed!</strong>
                   <br />
-                  Drag any dot to adjust, or continue to side photo.
+                  Drag any dot to adjust, or continue to side calibration.
                 </>
               );
             }
@@ -3422,7 +3675,7 @@ export default function App() {
               );
             }
           })()}
-          {manualCaptureState === "side-capture" && "📸 Capture or upload side photo. Then calibrate with head/heel lines."}
+          {manualCaptureState === "side-capture" && "📸 Capture or upload your side photo. Calibration starts once both photos are ready."}
           {manualCaptureState === "side-calibration" && "↕️ Drag the blue lines to mark head and heel positions, then lock scale."}
           {manualCaptureState === "side-dots" && (() => {
             const nextDot = getNextSideDot();

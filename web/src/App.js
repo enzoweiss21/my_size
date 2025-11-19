@@ -48,14 +48,46 @@ export default function App() {
   const [sideMeasurements, setSideMeasurements] = useState(null);
   // combined 3D measurements (calculated from both)
   const [bodyMeasurements, setBodyMeasurements] = useState(null);
+  
+  // Unit preference: false = cm, true = inches
+  const [useInches, setUseInches] = useState(false);
 
   // Manual drawing mode state
   const [manualDots, setManualDots] = useState({
-    front: { left: null, right: null }, // { x, y } coordinates for waist dots on front photo
-    side: { front: null, back: null }   // { x, y } coordinates for waist dots on side photo
+    front: {
+      shoulders: { left: null, right: null },
+      chest: { left: null, right: null },
+      waist: { left: null, right: null },
+      hips: { left: null, right: null },
+      // Thigh measurements: thickness (left/right) and upper leg length (top to knee)
+      thighs: { left: null, right: null, top: null }, // left/right = thickness, top = top of thigh
+      // Knee is the midpoint for leg length
+      knee: { center: null }, // Single point at knee (midpoint for leg length)
+      // Calf measurements: thickness (left/right) and lower leg length (knee to ankle)
+      calves: { left: null, right: null, bottom: null } // left/right = thickness, bottom = ankle
+    },
+    side: {
+      chest: { front: null, back: null },
+      waist: { front: null, back: null },
+      hips: { front: null, back: null },
+      thighs: { front: null, back: null }, // Thigh depth/thickness
+      calves: { front: null, back: null }  // Calf depth/thickness
+    }
   });
-  const [activeDot, setActiveDot] = useState(null); // "left" | "right" | "front" | "back" | null
-  const [manualCaptureState, setManualCaptureState] = useState("calibration"); // "calibration" | "front-dots" | "side-dots"
+  const [activeDotType, setActiveDotType] = useState(null); // Tracks which measurement type we're placing
+  const [draggingDot, setDraggingDot] = useState(null); // e.g. "shoulders-left" | "chest-right" | null
+  const [manualCaptureState, setManualCaptureState] = useState("front-capture"); // "front-capture" | "front-calibration" | "side-capture" | "side-calibration" | "front-dots" | "side-dots"
+  
+  // Separate calibration for front and side photos
+  const [frontHeadY, setFrontHeadY] = useState(200);
+  const [frontHeelY, setFrontHeelY] = useState(700);
+  const [frontScaleMmPerPx, setFrontScaleMmPerPx] = useState(null);
+  const [frontDragging, setFrontDragging] = useState(null); // "head" | "heel" | null
+  
+  const [sideHeadY, setSideHeadY] = useState(200);
+  const [sideHeelY, setSideHeelY] = useState(700);
+  const [sideScaleMmPerPx, setSideScaleMmPerPx] = useState(null);
+  const [sideDragging, setSideDragging] = useState(null); // "head" | "heel" | null
 
   // ---- camera init ----
   useEffect(() => {
@@ -129,6 +161,114 @@ export default function App() {
     })();
   }, []);
 
+  // ---- ensure canvas is available when switching to dot placement ----
+  useEffect(() => {
+    if (mode === "manual") {
+      if (manualCaptureState === "front-dots" && frontImageData) {
+        // Ensure canvas is set to front image
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.createElement("canvas");
+          canvas.width = img.width;
+          canvas.height = img.height;
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0);
+          capturedCanvasRef.current = canvas;
+        };
+        img.src = frontImageData;
+      } else if (manualCaptureState === "side-dots" && sideImageData) {
+        // Ensure canvas is set to side image
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.createElement("canvas");
+          canvas.width = img.width;
+          canvas.height = img.height;
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0);
+          capturedCanvasRef.current = canvas;
+        };
+        img.src = sideImageData;
+      }
+    }
+  }, [mode, manualCaptureState, frontImageData, sideImageData]);
+
+  // ---- ensure camera stream is attached when in capture mode ----
+  useEffect(() => {
+    if (mode === "manual" && (manualCaptureState === "front-capture" || manualCaptureState === "side-capture")) {
+      const ensureCamera = () => {
+        if (videoRef.current && streamRef.current) {
+          // Check if stream is still active
+          const tracks = streamRef.current.getTracks();
+          const activeTracks = tracks.filter(t => t.readyState === 'live');
+          
+          if (activeTracks.length === 0) {
+            console.log("Camera stream ended, reinitializing...");
+            // Stream ended, need to reinitialize
+            (async () => {
+              try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                  video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+                  audio: false,
+                });
+                streamRef.current = stream;
+                if (videoRef.current) {
+                  videoRef.current.srcObject = stream;
+                  videoRef.current.play().catch(console.error);
+                }
+              } catch (err) {
+                console.error("Failed to reinitialize camera:", err);
+              }
+            })();
+            return;
+          }
+          
+          // Reattach stream if needed
+          if (videoRef.current.srcObject !== streamRef.current) {
+            videoRef.current.srcObject = streamRef.current;
+          }
+          
+          // Ensure video plays
+          videoRef.current.play().catch(err => {
+            console.error("Video play error:", err);
+            // Retry after a short delay
+            setTimeout(() => {
+              if (videoRef.current && streamRef.current) {
+                videoRef.current.srcObject = streamRef.current;
+                videoRef.current.play().catch(console.error);
+              }
+            }, 100);
+          });
+        } else if (videoRef.current && !streamRef.current) {
+          // Video element exists but no stream - try to get it
+          console.log("Video element found but no stream, initializing camera...");
+          (async () => {
+            try {
+              const stream = await navigator.mediaDevices.getUserMedia({
+                video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+                audio: false,
+              });
+              streamRef.current = stream;
+              if (videoRef.current) {
+                videoRef.current.srcObject = stream;
+                videoRef.current.play().catch(console.error);
+              }
+            } catch (err) {
+              console.error("Failed to initialize camera:", err);
+            }
+          })();
+        }
+      };
+      
+      // Try immediately
+      ensureCamera();
+      
+      // Also try after a short delay to handle async mounting
+      const timeout = setTimeout(ensureCamera, 100);
+      
+      return () => clearTimeout(timeout);
+    }
+  }, [mode, manualCaptureState]);
+
   // ---- draw overlay (lines + level bubble + scale readout) ----
   useEffect(() => {
     const cvs = overlayRef.current, disp = displayRef.current;
@@ -150,21 +290,41 @@ export default function App() {
       // draggable lines (map 0..720 to canvas height)
       // Show calibration lines during calibration phase (both pose and manual modes)
       // Hide them only during dot placement in manual mode
-      const shouldShowCalibrationLines = mode === "pose" || 
-        (mode === "manual" && manualCaptureState === "calibration") ||
-        (mode === "manual" && manualCaptureState === "side-capture");
-      
-      if (shouldShowCalibrationLines) {
-        const yHeadPx = (headY / 720) * h;
-        const yHeelPx = (heelY / 720) * h;
+      if (mode === "pose") {
+      const yHeadPx = (headY / 720) * h;
+      const yHeelPx = (heelY / 720) * h;
+      ctx.strokeStyle = "#60a5fa"; ctx.lineWidth = 3; ctx.setLineDash([8,6]);
+      ctx.beginPath(); ctx.moveTo(0, yHeadPx); ctx.lineTo(w, yHeadPx); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, yHeelPx); ctx.lineTo(w, yHeelPx); ctx.stroke();
+      ctx.setLineDash([]);
+      } else if (mode === "manual" && manualCaptureState === "front-calibration") {
+        const yHeadPx = (frontHeadY / 720) * h;
+        const yHeelPx = (frontHeelY / 720) * h;
+        ctx.strokeStyle = "#60a5fa"; ctx.lineWidth = 3; ctx.setLineDash([8,6]);
+        ctx.beginPath(); ctx.moveTo(0, yHeadPx); ctx.lineTo(w, yHeadPx); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(0, yHeelPx); ctx.lineTo(w, yHeelPx); ctx.stroke();
+        ctx.setLineDash([]);
+      } else if (mode === "manual" && manualCaptureState === "side-calibration") {
+        const yHeadPx = (sideHeadY / 720) * h;
+        const yHeelPx = (sideHeelY / 720) * h;
         ctx.strokeStyle = "#60a5fa"; ctx.lineWidth = 3; ctx.setLineDash([8,6]);
         ctx.beginPath(); ctx.moveTo(0, yHeadPx); ctx.lineTo(w, yHeadPx); ctx.stroke();
         ctx.beginPath(); ctx.moveTo(0, yHeelPx); ctx.lineTo(w, yHeelPx); ctx.stroke();
         ctx.setLineDash([]);
       }
 
-      if (scaleMmPerPx) {
-        const txt = `scale: ${scaleMmPerPx.toFixed(3)} mm/px`;
+      // Show scale readout
+      let currentScale = scaleMmPerPx;
+      if (mode === "manual") {
+        if (manualCaptureState === "front-calibration" || manualCaptureState === "front-dots") {
+          currentScale = frontScaleMmPerPx;
+        } else if (manualCaptureState === "side-calibration" || manualCaptureState === "side-dots") {
+          currentScale = sideScaleMmPerPx;
+        }
+      }
+      
+      if (currentScale) {
+        const txt = `scale: ${currentScale.toFixed(3)} mm/px`;
         const m = ctx.measureText(txt);
         ctx.fillStyle = "#111827";
         ctx.fillRect(w - m.width - 26, 12, m.width + 16, 26);
@@ -194,33 +354,266 @@ export default function App() {
     };
     draw();
     return () => cancelAnimationFrame(raf);
-  }, [headY, heelY, scaleMmPerPx, pitchDeg, rollDeg, capturedDataUrl, sideImageData, countdown, mode, manualCaptureState]);
+  }, [headY, heelY, scaleMmPerPx, pitchDeg, rollDeg, capturedDataUrl, sideImageData, countdown, mode, manualCaptureState, frontHeadY, frontHeelY, frontScaleMmPerPx, sideHeadY, sideHeelY, sideScaleMmPerPx]);
 
   // ---- drag handlers ----
   const onPointerDown = (e) => {
-    // Don't allow dragging calibration lines during manual dot placement
-    if (mode === "manual" && (manualCaptureState === "front-dots" || manualCaptureState === "side-dots")) {
-      return;
+    // Handle calibration line dragging for manual mode
+    if (mode === "manual") {
+      if (manualCaptureState === "front-calibration") {
+        const rect = overlayRef.current.getBoundingClientRect();
+        const y = e.clientY - rect.top;
+        const y720 = (y / overlayRef.current.height) * 720;
+        if (Math.abs(y720 - frontHeadY) < 16) setFrontDragging("head");
+        else if (Math.abs(y720 - frontHeelY) < 16) setFrontDragging("heel");
+        return;
+      } else if (manualCaptureState === "side-calibration") {
+        const rect = overlayRef.current.getBoundingClientRect();
+        const y = e.clientY - rect.top;
+        const y720 = (y / overlayRef.current.height) * 720;
+        if (Math.abs(y720 - sideHeadY) < 16) setSideDragging("head");
+        else if (Math.abs(y720 - sideHeelY) < 16) setSideDragging("heel");
+        return;
+      } else if (manualCaptureState === "front-dots" || manualCaptureState === "side-dots") {
+        // Handle dot dragging - find closest dot
+        const rect = overlayRef.current.getBoundingClientRect();
+        const img = displayRef.current;
+        if (!img || !capturedCanvasRef.current) return;
+        
+        const imgRect = img.getBoundingClientRect();
+        const containerRect = img.parentElement?.getBoundingClientRect();
+        if (!containerRect) return;
+        
+        const offsetX = (containerRect.width - imgRect.width) / 2;
+        const offsetY = (containerRect.height - imgRect.height) / 2;
+        const imageWidth = capturedCanvasRef.current.width || img.naturalWidth || img.width;
+        const imageHeight = capturedCanvasRef.current.height || img.naturalHeight || img.height;
+        const scaleX = imageWidth / imgRect.width;
+        const scaleY = imageHeight / imgRect.height;
+        
+        const clickX = (e.clientX - rect.left - offsetX) * scaleX;
+        const clickY = (e.clientY - rect.top - offsetY) * scaleY;
+        
+        const threshold = 20 * scaleX; // 20px threshold in image space
+        
+        let closestDot = null;
+        let closestDist = threshold;
+        
+        if (manualCaptureState === "front-dots") {
+          // Standard width measurements (left/right)
+          const widthTypes = ['shoulders', 'chest', 'waist', 'hips'];
+          for (const type of widthTypes) {
+            if (manualDots.front[type].left) {
+              const dist = Math.sqrt(Math.pow(clickX - manualDots.front[type].left.x, 2) + Math.pow(clickY - manualDots.front[type].left.y, 2));
+              if (dist < closestDist) {
+                closestDist = dist;
+                closestDot = `${type}-left`;
+              }
+            }
+            if (manualDots.front[type].right) {
+              const dist = Math.sqrt(Math.pow(clickX - manualDots.front[type].right.x, 2) + Math.pow(clickY - manualDots.front[type].right.y, 2));
+              if (dist < closestDist) {
+                closestDist = dist;
+                closestDot = `${type}-right`;
+              }
+            }
+          }
+          
+          // Thigh measurements: left, right, top
+          if (manualDots.front.thighs.left) {
+            const dist = Math.sqrt(Math.pow(clickX - manualDots.front.thighs.left.x, 2) + Math.pow(clickY - manualDots.front.thighs.left.y, 2));
+            if (dist < closestDist) {
+              closestDist = dist;
+              closestDot = 'thighs-left';
+            }
+          }
+          if (manualDots.front.thighs.right) {
+            const dist = Math.sqrt(Math.pow(clickX - manualDots.front.thighs.right.x, 2) + Math.pow(clickY - manualDots.front.thighs.right.y, 2));
+            if (dist < closestDist) {
+              closestDist = dist;
+              closestDot = 'thighs-right';
+            }
+          }
+          if (manualDots.front.thighs.top) {
+            const dist = Math.sqrt(Math.pow(clickX - manualDots.front.thighs.top.x, 2) + Math.pow(clickY - manualDots.front.thighs.top.y, 2));
+            if (dist < closestDist) {
+              closestDist = dist;
+              closestDot = 'thighs-top';
+            }
+          }
+          
+          // Knee center
+          if (manualDots.front.knee.center) {
+            const dist = Math.sqrt(Math.pow(clickX - manualDots.front.knee.center.x, 2) + Math.pow(clickY - manualDots.front.knee.center.y, 2));
+            if (dist < closestDist) {
+              closestDist = dist;
+              closestDot = 'knee-center';
+            }
+          }
+          
+          // Calf measurements: left, right, bottom
+          if (manualDots.front.calves.left) {
+            const dist = Math.sqrt(Math.pow(clickX - manualDots.front.calves.left.x, 2) + Math.pow(clickY - manualDots.front.calves.left.y, 2));
+            if (dist < closestDist) {
+              closestDist = dist;
+              closestDot = 'calves-left';
+            }
+          }
+          if (manualDots.front.calves.right) {
+            const dist = Math.sqrt(Math.pow(clickX - manualDots.front.calves.right.x, 2) + Math.pow(clickY - manualDots.front.calves.right.y, 2));
+            if (dist < closestDist) {
+              closestDist = dist;
+              closestDot = 'calves-right';
+            }
+          }
+          if (manualDots.front.calves.bottom) {
+            const dist = Math.sqrt(Math.pow(clickX - manualDots.front.calves.bottom.x, 2) + Math.pow(clickY - manualDots.front.calves.bottom.y, 2));
+            if (dist < closestDist) {
+              closestDist = dist;
+              closestDot = 'calves-bottom';
+            }
+          }
+        } else if (manualCaptureState === "side-dots") {
+          const types = ['chest', 'waist', 'hips', 'thighs', 'calves'];
+          for (const type of types) {
+            if (manualDots.side[type].front) {
+              const dist = Math.sqrt(Math.pow(clickX - manualDots.side[type].front.x, 2) + Math.pow(clickY - manualDots.side[type].front.y, 2));
+              if (dist < closestDist) {
+                closestDist = dist;
+                closestDot = `${type}-front`;
+              }
+            }
+            if (manualDots.side[type].back) {
+              const dist = Math.sqrt(Math.pow(clickX - manualDots.side[type].back.x, 2) + Math.pow(clickY - manualDots.side[type].back.y, 2));
+              if (dist < closestDist) {
+                closestDist = dist;
+                closestDot = `${type}-back`;
+              }
+            }
+          }
+        }
+        
+        if (closestDot) {
+          setDraggingDot(closestDot);
+          return;
+        }
+        return;
+      }
     }
+    
+    // Pose estimation mode - original behavior
     const rect = overlayRef.current.getBoundingClientRect();
     const y = e.clientY - rect.top;
     const y720 = (y / overlayRef.current.height) * 720;
     if (Math.abs(y720 - headY) < 16) setDragging("head");
     else if (Math.abs(y720 - heelY) < 16) setDragging("heel");
   };
+  
   const onPointerMove = (e) => {
-    if (!dragging) return;
-    // Don't allow dragging calibration lines during manual dot placement
-    if (mode === "manual" && (manualCaptureState === "front-dots" || manualCaptureState === "side-dots")) {
-      return;
+    // Handle calibration line dragging for manual mode
+    if (mode === "manual") {
+      if (frontDragging && manualCaptureState === "front-calibration") {
+        const rect = overlayRef.current.getBoundingClientRect();
+        const y = e.clientY - rect.top;
+        const y720 = Math.max(0, Math.min(720, (y / overlayRef.current.height) * 720));
+        if (frontDragging === "head") setFrontHeadY(y720);
+        else setFrontHeelY(y720);
+        return;
+      } else if (sideDragging && manualCaptureState === "side-calibration") {
+        const rect = overlayRef.current.getBoundingClientRect();
+        const y = e.clientY - rect.top;
+        const y720 = Math.max(0, Math.min(720, (y / overlayRef.current.height) * 720));
+        if (sideDragging === "head") setSideHeadY(y720);
+        else setSideHeelY(y720);
+        return;
+      } else if (draggingDot && (manualCaptureState === "front-dots" || manualCaptureState === "side-dots")) {
+        // Handle dot dragging - parse draggingDot format: "type-side" or "type-front/back"
+        const rect = overlayRef.current.getBoundingClientRect();
+        const img = displayRef.current;
+        if (!img) return;
+        
+        const imgRect = img.getBoundingClientRect();
+        const containerRect = img.parentElement?.getBoundingClientRect();
+        if (!containerRect) return;
+        
+        const offsetX = (containerRect.width - imgRect.width) / 2;
+        const offsetY = (containerRect.height - imgRect.height) / 2;
+        const imageWidth = capturedCanvasRef.current?.width || img.naturalWidth || img.width;
+        const imageHeight = capturedCanvasRef.current?.height || img.naturalHeight || img.height;
+        const scaleX = imageWidth / imgRect.width;
+        const scaleY = imageHeight / imgRect.height;
+        
+        const moveX = (e.clientX - rect.left - offsetX) * scaleX;
+        const moveY = (e.clientY - rect.top - offsetY) * scaleY;
+        
+        // Clamp to image bounds
+        const clampedX = Math.max(0, Math.min(imageWidth, moveX));
+        const clampedY = Math.max(0, Math.min(imageHeight, moveY));
+        
+        // Handle special case of "knee-center" where we need to handle it differently
+        let type, side;
+        if (draggingDot === 'knee-center') {
+          type = 'knee';
+          side = 'center';
+        } else {
+          [type, side] = draggingDot.split('-');
+        }
+        
+        if (manualCaptureState === "front-dots") {
+          // Special handling for knee.center which is a single point, not an object with nested properties
+          if (type === 'knee' && side === 'center') {
+            setManualDots(prev => ({
+              ...prev,
+              front: {
+                ...prev.front,
+                knee: {
+                  center: { x: clampedX, y: clampedY }
+                }
+              }
+            }));
+          } else {
+            setManualDots(prev => ({
+              ...prev,
+              front: {
+                ...prev.front,
+                [type]: {
+                  ...prev.front[type],
+                  [side]: { x: clampedX, y: clampedY }
+                }
+              }
+            }));
+          }
+        } else if (manualCaptureState === "side-dots") {
+          setManualDots(prev => ({
+            ...prev,
+            side: {
+              ...prev.side,
+              [type]: {
+                ...prev.side[type],
+                [side]: { x: clampedX, y: clampedY }
+              }
+            }
+          }));
+        }
+        return;
+      }
     }
+    
+    // Pose estimation mode - original behavior
+    if (!dragging) return;
     const rect = overlayRef.current.getBoundingClientRect();
     const y = e.clientY - rect.top;
     const y720 = Math.max(0, Math.min(720, (y / overlayRef.current.height) * 720));
     if (dragging === "head") setHeadY(y720);
     else setHeelY(y720);
   };
-  const onPointerUp = () => setDragging(null);
+  
+  const onPointerUp = () => {
+    setDragging(null);
+    setFrontDragging(null);
+    setSideDragging(null);
+    setDraggingDot(null);
+  };
 
   // ---- compute pixel calibration scale ----
   // This establishes the pixel-to-millimeter conversion ratio using:
@@ -229,7 +622,48 @@ export default function App() {
   // Formula: scaleMmPerPx = (heightCm * 10) / spanPx
   // This calibration is then used with deterministic segmentation scanning
   const lockScale = () => {
-    // Get the actual image/canvas dimensions
+    // Handle manual mode - separate calibration for front and side
+    if (mode === "manual") {
+      if (manualCaptureState === "front-calibration") {
+        const canvas = capturedCanvasRef.current;
+        if (!canvas) {
+          return alert("No front image captured. Please capture a photo first.");
+        }
+        
+        const actualImageHeight = canvas.height;
+        const headYPx = (frontHeadY / 720) * actualImageHeight;
+        const heelYPx = (frontHeelY / 720) * actualImageHeight;
+        const spanPx = Math.abs(heelYPx - headYPx);
+        
+    if (spanPx < 200) return alert("Subject too small in frame. Step back.");
+    if (Math.abs(pitchDeg) > 2 || Math.abs(rollDeg) > 2) return alert("Hold phone level (|pitch|,|roll| < 2°).");
+        
+        const computedScale = (heightCm * 10) / spanPx;
+        setFrontScaleMmPerPx(computedScale);
+        console.log(`Front pixel calibration locked: ${computedScale.toFixed(3)} mm/px`);
+        return;
+      } else if (manualCaptureState === "side-calibration") {
+        const canvas = capturedCanvasRef.current;
+        if (!canvas) {
+          return alert("No side image captured. Please capture a photo first.");
+        }
+        
+        const actualImageHeight = canvas.height;
+        const headYPx = (sideHeadY / 720) * actualImageHeight;
+        const heelYPx = (sideHeelY / 720) * actualImageHeight;
+        const spanPx = Math.abs(heelYPx - headYPx);
+        
+        if (spanPx < 200) return alert("Subject too small in frame. Step back.");
+        if (Math.abs(pitchDeg) > 2 || Math.abs(rollDeg) > 2) return alert("Hold phone level (|pitch|,|roll| < 2°).");
+        
+        const computedScale = (heightCm * 10) / spanPx;
+        setSideScaleMmPerPx(computedScale);
+        console.log(`Side pixel calibration locked: ${computedScale.toFixed(3)} mm/px`);
+        return;
+      }
+    }
+    
+    // Pose estimation mode - original behavior
     const canvas = capturedCanvasRef.current;
     if (!canvas) {
       return alert("No image captured. Please capture a photo first.");
@@ -238,7 +672,6 @@ export default function App() {
     const actualImageHeight = canvas.height;
     const actualImageWidth = canvas.width;
     
-    // Convert logical coordinates (0-720) to actual pixel coordinates
     const headYPx = (headY / 720) * actualImageHeight;
     const heelYPx = (heelY / 720) * actualImageHeight;
     const spanPx = Math.abs(heelYPx - headYPx);
@@ -246,7 +679,7 @@ export default function App() {
     if (spanPx < 200) return alert("Subject too small in frame. Step back.");
     if (Math.abs(pitchDeg) > 2 || Math.abs(rollDeg) > 2) return alert("Hold phone level (|pitch|,|roll| < 2°).");
     
-    const computedScale = (heightCm * 10) / spanPx; // mm per pixel
+    const computedScale = (heightCm * 10) / spanPx;
     setScaleMmPerPx(computedScale);
     console.log(`Pixel calibration locked: ${computedScale.toFixed(3)} mm/px`);
     console.log(`  Image dimensions: ${actualImageWidth}×${actualImageHeight}px`);
@@ -1367,19 +1800,10 @@ export default function App() {
 
         if (photoType === "front") {
           setFrontImageData(dataUrl);
-          // Keep in calibration state if currently calibrating, otherwise move to dot placement
-          if (manualCaptureState === "calibration") {
-            // Stay in calibration to allow adjusting lines and locking scale
-          } else {
-            setManualCaptureState("front-dots");
-            setActiveDot("left");
-          }
+          setManualCaptureState("front-calibration");
         } else if (photoType === "side") {
           setSideImageData(dataUrl);
-          // Transition to side-dots when uploading side photo
-          // Scale should already be locked from front calibration
-          setManualCaptureState("side-dots");
-          setActiveDot("front");
+          setManualCaptureState("side-calibration");
         }
       };
       img.src = e.target.result;
@@ -1393,83 +1817,272 @@ export default function App() {
     event.target.value = '';
   };
 
-  // Manual drawing: handle clicking on image to place dots
-  const handleManualImageClick = (e, photoType) => {
-    if (!capturedCanvasRef.current) return;
+  // Helper: Get next dot to place for front photo
+  const getNextFrontDot = () => {
+    // Standard width measurements (left/right)
+    const widthOrder = ['shoulders', 'chest', 'waist', 'hips'];
+    for (const type of widthOrder) {
+      if (!manualDots.front[type].left) {
+        return { type, side: 'left' };
+      }
+      if (!manualDots.front[type].right) {
+        return { type, side: 'right' };
+      }
+    }
     
-    if (!scaleMmPerPx) {
-      alert("Please lock the scale first before placing dots.");
+    // Thigh measurements: thickness (left/right) then length (top)
+    if (!manualDots.front.thighs.left) {
+      return { type: 'thighs', side: 'left' };
+    }
+    if (!manualDots.front.thighs.right) {
+      return { type: 'thighs', side: 'right' };
+    }
+    if (!manualDots.front.thighs.top) {
+      return { type: 'thighs', side: 'top' };
+    }
+    
+    // Knee center point (midpoint for leg length)
+    if (!manualDots.front.knee.center) {
+      return { type: 'knee', side: 'center' };
+    }
+    
+    // Calf measurements: thickness (left/right) then length (bottom)
+    if (!manualDots.front.calves.left) {
+      return { type: 'calves', side: 'left' };
+    }
+    if (!manualDots.front.calves.right) {
+      return { type: 'calves', side: 'right' };
+    }
+    if (!manualDots.front.calves.bottom) {
+      return { type: 'calves', side: 'bottom' };
+    }
+    
+    return null; // All dots placed
+  };
+
+  // Helper: Get next dot to place for side photo
+  const getNextSideDot = () => {
+    const order = ['chest', 'waist', 'hips', 'thighs', 'calves'];
+    for (const type of order) {
+      if (!manualDots.side[type].front) {
+        return { type, side: 'front' };
+      }
+      if (!manualDots.side[type].back) {
+        return { type, side: 'back' };
+      }
+    }
+    return null; // All dots placed
+  };
+
+  // Helper: Check if all front dots are placed
+  const areAllFrontDotsPlaced = () => {
+    // Standard width measurements
+    const widthComplete = ['shoulders', 'chest', 'waist', 'hips'].every(type => 
+      manualDots.front[type].left && manualDots.front[type].right
+    );
+    
+    // Thigh measurements: left, right, and top
+    const thighsComplete = manualDots.front.thighs.left && 
+                          manualDots.front.thighs.right && 
+                          manualDots.front.thighs.top;
+    
+    // Knee center
+    const kneeComplete = manualDots.front.knee.center !== null;
+    
+    // Calf measurements: left, right, and bottom
+    const calvesComplete = manualDots.front.calves.left && 
+                          manualDots.front.calves.right && 
+                          manualDots.front.calves.bottom;
+    
+    return widthComplete && thighsComplete && kneeComplete && calvesComplete;
+  };
+
+  // Helper: Check if all side dots are placed
+  const areAllSideDotsPlaced = () => {
+    return ['chest', 'waist', 'hips', 'thighs', 'calves'].every(type => 
+      manualDots.side[type].front && manualDots.side[type].back
+    );
+  };
+
+  // Helper: Get dot color based on type and photo type
+  const getDotColor = (photoType, type, side) => {
+    const colors = {
+      front: {
+        shoulders: { left: '#ff6b6b', right: '#ee5a6f' },
+        chest: { left: '#4ecdc4', right: '#44a08d' },
+        waist: { left: '#3b82f6', right: '#ef4444' },
+        hips: { left: '#9b59b6', right: '#8e44ad' },
+        thighs: { left: '#f39c12', right: '#e67e22', top: '#f39c12' }, // Thickness (left/right) and length (top)
+        knee: { center: '#e74c3c' }, // Knee center point
+        calves: { left: '#1abc9c', right: '#16a085', bottom: '#1abc9c' } // Thickness (left/right) and length (bottom)
+      },
+      side: {
+        chest: { front: '#f59e0b', back: '#d97706' },
+        waist: { front: '#f59e0b', back: '#8b5cf6' },
+        hips: { front: '#10b981', back: '#059669' },
+        thighs: { front: '#f39c12', back: '#e67e22' }, // Thigh depth/thickness
+        calves: { front: '#1abc9c', back: '#16a085' }  // Calf depth/thickness
+      }
+    };
+    return colors[photoType]?.[type]?.[side] || '#60a5fa';
+  };
+
+  // Manual drawing: handle clicking on image to place dots (if not dragging)
+  const handleManualImageClick = (e, photoType) => {
+    // If already dragging a dot, don't place a new one
+    if (draggingDot) {
+      console.log("Already dragging a dot, ignoring click");
       return;
     }
     
-    const rect = e.currentTarget.getBoundingClientRect();
-    const scaleX = capturedCanvasRef.current.width / rect.width;
-    const scaleY = capturedCanvasRef.current.height / rect.height;
+    e.preventDefault();
+    e.stopPropagation();
     
-    const x = (e.clientX - rect.left) * scaleX;
-    const y = (e.clientY - rect.top) * scaleY;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const img = displayRef.current;
+    if (!img) {
+      console.log("No image element found");
+      return;
+    }
+    
+    if (!img.complete) {
+      console.log("Image not loaded yet");
+      return;
+    }
+    
+    const imgRect = img.getBoundingClientRect();
+    const containerRect = img.parentElement?.getBoundingClientRect();
+    if (!containerRect) {
+      console.log("No container element found");
+      return;
+    }
+    
+    const offsetX = (containerRect.width - imgRect.width) / 2;
+    const offsetY = (containerRect.height - imgRect.height) / 2;
+    
+    // Use image natural dimensions or canvas if available
+    const imageWidth = capturedCanvasRef.current?.width || img.naturalWidth || img.width;
+    const imageHeight = capturedCanvasRef.current?.height || img.naturalHeight || img.height;
+    
+    const scaleX = imageWidth / imgRect.width;
+    const scaleY = imageHeight / imgRect.height;
+    
+    const clickX = (e.clientX - rect.left - offsetX) * scaleX;
+    const clickY = (e.clientY - rect.top - offsetY) * scaleY;
+    
+    // Clamp to image bounds
+    const clampedX = Math.max(0, Math.min(imageWidth, clickX));
+    const clampedY = Math.max(0, Math.min(imageHeight, clickY));
+    
+    console.log(`Click on ${photoType} photo:`, { clickX, clickY, clampedX, clampedY });
     
     if (photoType === "front") {
-      if (activeDot === "left") {
-        setManualDots(prev => ({ ...prev, front: { ...prev.front, left: { x, y } } }));
-        setActiveDot("right");
-      } else if (activeDot === "right") {
-        setManualDots(prev => ({ ...prev, front: { ...prev.front, right: { x, y } } }));
-        setActiveDot(null);
+      const nextDot = getNextFrontDot();
+      if (nextDot) {
+        console.log(`Placing ${nextDot.type} ${nextDot.side} dot at:`, { x: clampedX, y: clampedY });
+        setManualDots(prev => {
+          const updated = {
+            ...prev,
+            front: {
+              ...prev.front,
+              [nextDot.type]: {
+                ...prev.front[nextDot.type],
+                [nextDot.side]: { x: clampedX, y: clampedY }
+              }
+            }
+          };
+          console.log("Updated manualDots:", updated);
+          return updated;
+        });
+      } else {
+        console.log("All front dots already placed");
       }
     } else if (photoType === "side") {
-      if (activeDot === "front") {
-        setManualDots(prev => ({ ...prev, side: { ...prev.side, front: { x, y } } }));
-        setActiveDot("back");
-      } else if (activeDot === "back") {
-        setManualDots(prev => ({ ...prev, side: { ...prev.side, back: { x, y } } }));
-        setActiveDot(null);
+      const nextDot = getNextSideDot();
+      if (nextDot) {
+        console.log(`Placing ${nextDot.type} ${nextDot.side} dot at:`, { x: clampedX, y: clampedY });
+        setManualDots(prev => {
+          const updated = {
+            ...prev,
+            side: {
+              ...prev.side,
+              [nextDot.type]: {
+                ...prev.side[nextDot.type],
+                [nextDot.side]: { x: clampedX, y: clampedY }
+              }
+            }
+          };
+          console.log("Updated manualDots:", updated);
+          return updated;
+        });
+      } else {
+        console.log("All side dots already placed");
+      }
+    }
+  };
+
+  // Helper: Convert cm to inches (1 cm = 0.393701 inches)
+  const cmToInches = (cm) => {
+    return Math.round((cm * 0.393701) * 10) / 10;
+  };
+
+  // Helper: Format measurement display based on unit preference
+  const formatMeasurement = (cmValue, unit = "length") => {
+    if (!cmValue && cmValue !== 0) return { main: "—", sub: "" };
+    
+    if (useInches) {
+      const inches = cmToInches(cmValue);
+      if (unit === "area") {
+        // Convert cm² to in² (1 cm² = 0.155 in²)
+        const sqInches = Math.round((cmValue * 0.155) * 10) / 10;
+        return { main: `${sqInches} in²`, sub: `${cmValue.toFixed(1)} cm²` };
+      } else if (unit === "volume") {
+        // Keep as cm³ for now, could convert to in³ or fl oz
+        return { main: `${cmValue.toFixed(1)} cm³`, sub: "" };
+      } else {
+        // Length measurement
+        return { main: `${inches} in`, sub: `${cmValue.toFixed(1)} cm` };
+      }
+    } else {
+      // Use cm
+      if (unit === "area") {
+        return { main: `${cmValue.toFixed(1)} cm²`, sub: "" };
+      } else if (unit === "volume") {
+        return { main: `${cmValue.toFixed(1)} cm³`, sub: "" };
+      } else {
+        return { main: `${cmValue.toFixed(1)} cm`, sub: "" };
       }
     }
   };
 
   // Calculate manual measurements from dots
   const calculateManualMeasurements = () => {
-    if (!scaleMmPerPx || !capturedCanvasRef.current) return;
+    if (!frontScaleMmPerPx || !sideScaleMmPerPx) {
+      alert("Please lock scales for both front and side photos before calculating measurements.");
+      return null;
+    }
 
     const measurements = {};
 
-    // Calculate waist width from front photo dots
-    if (manualDots.front.left && manualDots.front.right) {
-      const dx = manualDots.front.right.x - manualDots.front.left.x;
-      const dy = manualDots.front.right.y - manualDots.front.left.y;
+    // Helper: Calculate distance between two points
+    const calculateDistance = (dot1, dot2, scale) => {
+      if (!dot1 || !dot2) return null;
+      const dx = dot2.x - dot1.x;
+      const dy = dot2.y - dot1.y;
       const distancePx = Math.sqrt(dx * dx + dy * dy);
-      const distanceMm = distancePx * scaleMmPerPx;
+      const distanceMm = distancePx * scale;
       const distanceCm = distanceMm / 10;
-
-      measurements.waistWidth = {
+      return {
         pixels: Math.round(distancePx),
         mm: Math.round(distanceMm),
         cm: Math.round(distanceCm * 10) / 10
       };
-    }
+    };
 
-    // Calculate waist depth from side photo dots
-    if (manualDots.side.front && manualDots.side.back) {
-      const dx = manualDots.side.back.x - manualDots.side.front.x;
-      const dy = manualDots.side.back.y - manualDots.side.front.y;
-      const distancePx = Math.sqrt(dx * dx + dy * dy);
-      const distanceMm = distancePx * scaleMmPerPx;
-      const distanceCm = distanceMm / 10;
-
-      measurements.waistDepth = {
-        pixels: Math.round(distancePx),
-        mm: Math.round(distanceMm),
-        cm: Math.round(distanceCm * 10) / 10
-      };
-    }
-
-    // Calculate 3D measurements if both width and depth are available
-    if (measurements.waistWidth && measurements.waistDepth) {
-      const width = measurements.waistWidth;
-      const depth = measurements.waistDepth;
-
-      // Calculate ellipse-based circumference and area
+    // Helper: Calculate 3D measurements from width and depth
+    const calculate3D = (width, depth, name) => {
+      if (!width || !depth) return null;
+      
       const semiMajorAxis = width.mm / 2;
       const semiMinorAxis = depth.mm / 2;
 
@@ -1480,7 +2093,8 @@ export default function App() {
       const circumferenceMm = Math.PI * (semiMajorAxis + semiMinorAxis) * (1 + (3 * h) / (10 + Math.sqrt(4 - 3 * h)));
       const circumferenceCm = circumferenceMm / 10;
 
-      measurements.waist3D = {
+      return {
+        name: name,
         width: width,
         depth: depth,
         circumference: {
@@ -1491,6 +2105,123 @@ export default function App() {
           cm2: Math.round(crossSectionalAreaCm2 * 10) / 10,
           mm2: Math.round(crossSectionalAreaMm2)
         }
+      };
+    };
+
+    // Calculate all front measurements (widths)
+    const frontTypes = ['shoulders', 'chest', 'waist', 'hips'];
+    frontTypes.forEach(type => {
+      const leftDot = manualDots.front[type].left;
+      const rightDot = manualDots.front[type].right;
+      console.log(`[${type} width] Left dot:`, leftDot, "Right dot:", rightDot);
+      const width = calculateDistance(leftDot, rightDot, frontScaleMmPerPx);
+      if (width) {
+        measurements[`${type}Width`] = width;
+        console.log(`[${type} width] Calculated:`, width);
+      } else {
+        console.log(`[${type} width] Failed to calculate - missing dots`);
+      }
+    });
+
+    // Calculate thigh and calf widths (thickness from front photo)
+    const thighsLeft = manualDots.front.thighs.left;
+    const thighsRight = manualDots.front.thighs.right;
+    console.log(`[thighs width] Left dot:`, thighsLeft, "Right dot:", thighsRight);
+    const thighsWidth = calculateDistance(thighsLeft, thighsRight, frontScaleMmPerPx);
+    if (thighsWidth) {
+      measurements.thighsWidth = thighsWidth;
+      console.log(`[thighs width] Calculated:`, thighsWidth);
+    } else {
+      console.log(`[thighs width] Failed to calculate - missing dots`);
+    }
+
+    const calvesLeft = manualDots.front.calves.left;
+    const calvesRight = manualDots.front.calves.right;
+    console.log(`[calves width] Left dot:`, calvesLeft, "Right dot:", calvesRight);
+    const calvesWidth = calculateDistance(calvesLeft, calvesRight, frontScaleMmPerPx);
+    if (calvesWidth) {
+      measurements.calvesWidth = calvesWidth;
+      console.log(`[calves width] Calculated:`, calvesWidth);
+    } else {
+      console.log(`[calves width] Failed to calculate - missing dots`);
+    }
+
+    // Calculate all side measurements (depths)
+    const sideTypes = ['chest', 'waist', 'hips', 'thighs', 'calves'];
+    sideTypes.forEach(type => {
+      const frontDot = manualDots.side[type].front;
+      const backDot = manualDots.side[type].back;
+      console.log(`[${type} depth] Front dot:`, frontDot, "Back dot:", backDot);
+      const depth = calculateDistance(frontDot, backDot, sideScaleMmPerPx);
+      if (depth) {
+        measurements[`${type}Depth`] = depth;
+        console.log(`[${type} depth] Calculated:`, depth);
+      } else {
+        console.log(`[${type} depth] Failed to calculate - missing dots`);
+      }
+    });
+
+    // Calculate 3D measurements for all available pairs
+    const all3DTypes = ['chest', 'waist', 'hips', 'thighs', 'calves'];
+    all3DTypes.forEach(type => {
+      const width = type === 'thighs' ? measurements.thighsWidth : 
+                    type === 'calves' ? measurements.calvesWidth :
+                    measurements[`${type}Width`];
+      const depth = measurements[`${type}Depth`];
+      console.log(`[${type} 3D] Width:`, width, "Depth:", depth);
+      if (width && depth) {
+        const type3D = calculate3D(width, depth, type);
+        if (type3D) {
+          measurements[`${type}3D`] = type3D;
+          console.log(`[${type} 3D] Calculated:`, type3D);
+        } else {
+          console.log(`[${type} 3D] Failed to calculate - calculate3D returned null`);
+        }
+      } else {
+        console.log(`[${type} 3D] Failed to calculate - missing width or depth. Width:`, width, "Depth:", depth);
+      }
+    });
+
+    // Calculate leg lengths from front photo (using knee as midpoint)
+    // Upper leg length: from thigh top to knee
+    if (manualDots.front.thighs.top && manualDots.front.knee.center) {
+      const upperLegLengthPx = Math.sqrt(
+        Math.pow(manualDots.front.knee.center.x - manualDots.front.thighs.top.x, 2) +
+        Math.pow(manualDots.front.knee.center.y - manualDots.front.thighs.top.y, 2)
+      );
+      const upperLegLengthMm = upperLegLengthPx * frontScaleMmPerPx;
+      measurements.upperLegLength = {
+        pixels: Math.round(upperLegLengthPx),
+        mm: Math.round(upperLegLengthMm),
+        cm: Math.round((upperLegLengthMm / 10) * 10) / 10
+      };
+    }
+
+    // Lower leg length: from knee to ankle (calves bottom)
+    if (manualDots.front.knee.center && manualDots.front.calves.bottom) {
+      const lowerLegLengthPx = Math.sqrt(
+        Math.pow(manualDots.front.calves.bottom.x - manualDots.front.knee.center.x, 2) +
+        Math.pow(manualDots.front.calves.bottom.y - manualDots.front.knee.center.y, 2)
+      );
+      const lowerLegLengthMm = lowerLegLengthPx * frontScaleMmPerPx;
+      measurements.lowerLegLength = {
+        pixels: Math.round(lowerLegLengthPx),
+        mm: Math.round(lowerLegLengthMm),
+        cm: Math.round((lowerLegLengthMm / 10) * 10) / 10
+      };
+    }
+
+    // Total leg length (thigh top to ankle)
+    if (manualDots.front.thighs.top && manualDots.front.calves.bottom) {
+      const totalLegLengthPx = Math.sqrt(
+        Math.pow(manualDots.front.calves.bottom.x - manualDots.front.thighs.top.x, 2) +
+        Math.pow(manualDots.front.calves.bottom.y - manualDots.front.thighs.top.y, 2)
+      );
+      const totalLegLengthMm = totalLegLengthPx * frontScaleMmPerPx;
+      measurements.totalLegLength = {
+        pixels: Math.round(totalLegLengthPx),
+        mm: Math.round(totalLegLengthMm),
+        cm: Math.round((totalLegLengthMm / 10) * 10) / 10
       };
     }
 
@@ -1504,14 +2235,7 @@ export default function App() {
       const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
       setCapturedDataUrl(dataUrl);
       setFrontImageData(dataUrl);
-      // Keep in calibration state to allow adjusting lines and locking scale
-      // State will transition to front-dots when user clicks "Start Placing Dots" button
-      if (manualCaptureState === "calibration") {
-        // Stay in calibration state
-      } else {
-        setManualCaptureState("front-dots");
-        setActiveDot("left");
-      }
+      setManualCaptureState("front-calibration");
     });
   };
 
@@ -1522,24 +2246,73 @@ export default function App() {
       const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
       setCapturedDataUrl(dataUrl);
       setSideImageData(dataUrl);
-      setManualCaptureState("side-dots");
-      setActiveDot("front");
+      setManualCaptureState("side-calibration");
     });
   };
 
   // Manual drawing: submit and calculate
   const handleManualSubmit = () => {
-    if (!scaleMmPerPx) {
-      alert("Please lock the scale first before calculating measurements.");
-      return;
-    }
-    
     const measurements = calculateManualMeasurements();
-    if (measurements && measurements.waist3D) {
-      setBodyMeasurements({ waist: measurements.waist3D });
+    if (measurements && Object.keys(measurements).length > 0) {
+      // Store all 3D measurements
+      const bodyMeasurementsObj = {};
+      ['chest', 'waist', 'hips', 'thighs', 'calves'].forEach(type => {
+        if (measurements[`${type}3D`]) {
+          bodyMeasurementsObj[type] = measurements[`${type}3D`];
+        }
+      });
+      
+      // Store leg length measurements
+      if (measurements.upperLegLength) {
+        bodyMeasurementsObj.upperLegLength = measurements.upperLegLength;
+      }
+      if (measurements.lowerLegLength) {
+        bodyMeasurementsObj.lowerLegLength = measurements.lowerLegLength;
+      }
+      if (measurements.totalLegLength) {
+        bodyMeasurementsObj.totalLegLength = measurements.totalLegLength;
+      }
+      
+      // Also store widths and depths
+      bodyMeasurementsObj.widths = {};
+      bodyMeasurementsObj.depths = {};
+      ['shoulders', 'chest', 'waist', 'hips'].forEach(type => {
+        if (measurements[`${type}Width`]) {
+          bodyMeasurementsObj.widths[type] = measurements[`${type}Width`];
+        }
+      });
+      if (measurements.thighsWidth) {
+        bodyMeasurementsObj.widths.thighs = measurements.thighsWidth;
+      }
+      if (measurements.calvesWidth) {
+        bodyMeasurementsObj.widths.calves = measurements.calvesWidth;
+      }
+      
+      ['chest', 'waist', 'hips', 'thighs', 'calves'].forEach(type => {
+        if (measurements[`${type}Depth`]) {
+          bodyMeasurementsObj.depths[type] = measurements[`${type}Depth`];
+        }
+      });
+      
+      setBodyMeasurements(bodyMeasurementsObj);
       console.log("Manual measurements calculated:", measurements);
+      console.log("Body measurements stored:", bodyMeasurementsObj);
+      
+      // Debug: Log all calculated measurements
+      console.log("=== Measurement Debug ===");
+      console.log("Widths:", measurements);
+      console.log("Chest 3D:", measurements.chest3D);
+      console.log("Waist 3D:", measurements.waist3D);
+      console.log("Hips 3D:", measurements.hips3D);
+      console.log("Thighs 3D:", measurements.thighs3D);
+      console.log("Calves 3D:", measurements.calves3D);
+      console.log("Thighs Width:", measurements.thighsWidth);
+      console.log("Thighs Depth:", measurements.thighsDepth);
+      console.log("Calves Width:", measurements.calvesWidth);
+      console.log("Calves Depth:", measurements.calvesDepth);
+      console.log("========================");
     } else {
-      alert("Please place all four dots (left/right on front, front/back on side) before submitting.");
+      alert("Please place all dots before submitting.");
     }
   };
 
@@ -1635,10 +2408,37 @@ export default function App() {
             setMode("select");
             // Reset states
             setCaptureState(null);
-            setManualCaptureState("calibration");
+            setManualCaptureState("front-capture");
             setBodyMeasurements(null);
-            setManualDots({ front: { left: null, right: null }, side: { front: null, back: null } });
-            setActiveDot(null);
+            setManualDots({
+              front: {
+                shoulders: { left: null, right: null },
+                chest: { left: null, right: null },
+                waist: { left: null, right: null },
+                hips: { left: null, right: null },
+                thighs: { left: null, right: null, top: null },
+                knee: { center: null },
+                calves: { left: null, right: null, bottom: null }
+              },
+              side: {
+                chest: { front: null, back: null },
+                waist: { front: null, back: null },
+                hips: { front: null, back: null },
+                thighs: { front: null, back: null },
+                calves: { front: null, back: null }
+              }
+            });
+            setDraggingDot(null);
+            setFrontHeadY(200);
+            setFrontHeelY(700);
+            setFrontScaleMmPerPx(null);
+            setSideHeadY(200);
+            setSideHeelY(700);
+            setSideScaleMmPerPx(null);
+            setCapturedDataUrl(null);
+            setFrontImageData(null);
+            setSideImageData(null);
+            capturedCanvasRef.current = null;
           }}
           style={{
             marginBottom: 16,
@@ -1654,12 +2454,36 @@ export default function App() {
         </button>
 
         <h1>Calibration</h1>
+        {mode === "manual" ? (
+          <p>Enter height. Then for each photo: drag <b>Head</b>/<b>Heel</b> lines → Lock scale → Place dots.</p>
+        ) : (
         <p>Enter height → drag <b>Head</b>/<b>Heel</b> lines → Lock scale.</p>
+        )}
 
         <div style={{display:"flex", gap:12, alignItems:"center", margin:"12px 0"}}>
           <input type="number" value={heightCm} onChange={e=>setHeightCm(+e.target.value)} style={{width:90}}/> cm
+          {mode === "manual" ? (
+            <>
+              {(manualCaptureState === "front-calibration" || manualCaptureState === "side-calibration") && (
+                <>
+                  <button onClick={lockScale} disabled={!capturedDataUrl}>
+                    {manualCaptureState === "front-calibration" ? "Lock Front Scale" : "Lock Side Scale"}
+                  </button>
+                  {manualCaptureState === "front-calibration" && frontScaleMmPerPx && (
+                    <span>Front Scale: {frontScaleMmPerPx.toFixed(3)} mm/px</span>
+                  )}
+                  {manualCaptureState === "side-calibration" && sideScaleMmPerPx && (
+                    <span>Side Scale: {sideScaleMmPerPx.toFixed(3)} mm/px</span>
+                  )}
+                </>
+              )}
+            </>
+          ) : (
+            <>
           <button onClick={lockScale}>Lock scale</button>
           {scaleMmPerPx && <span>Scale: {scaleMmPerPx.toFixed(3)} mm/px</span>}
+            </>
+          )}
         </div>
 
         {/* Pose Estimation Mode */}
@@ -1828,7 +2652,7 @@ export default function App() {
         {mode === "manual" && (
           <>
         <div style={{display:"flex", gap:12, margin:"12px 0", flexWrap:"wrap", alignItems:"center"}}>
-          {manualCaptureState === "calibration" && (
+          {manualCaptureState === "front-capture" && (
             <>
               <button 
                 onClick={handleManualCaptureFront} 
@@ -1853,42 +2677,85 @@ export default function App() {
                   onChange={(e) => handleManualFileUpload(e, "front")}
                 />
               </label>
-              {capturedDataUrl && (
-                <button onClick={retakePhoto} disabled={typeof countdown === "number"}>
-                  Retake Photo
-                </button>
-              )}
-              {capturedDataUrl && scaleMmPerPx && (
+            </>
+          )}
+          {manualCaptureState === "front-calibration" && (
+            <>
+              <button onClick={() => {
+                setManualCaptureState("front-capture");
+                setCapturedDataUrl(null);
+                setFrontImageData(null);
+                setFrontScaleMmPerPx(null);
+                setTimeout(() => {
+                  if (videoRef.current && streamRef.current) {
+                    videoRef.current.srcObject = streamRef.current;
+                    videoRef.current.play().catch(err => console.error("Video play error:", err));
+                  }
+                }, 100);
+              }}>
+                Retake Front
+              </button>
+              {frontScaleMmPerPx && (
                 <button 
-                  onClick={() => {
-                    setManualCaptureState("front-dots");
-                    setActiveDot("left");
-                  }}
+                  onClick={() => setManualCaptureState("front-dots")}
                   style={{background:"#10b981", color:"white", fontWeight:"bold"}}
                 >
-                  Start Placing Dots
+                  Place Front Dots
                 </button>
-              )}
-              {!scaleMmPerPx && (
-                <span style={{opacity: 0.7, fontSize: 12, marginLeft: 8}}>
-                  ⚠️ Lock scale before placing dots to measure
-                </span>
               )}
             </>
           )}
           {manualCaptureState === "front-dots" && (
             <>
               <button onClick={() => {
-                setManualCaptureState("calibration");
-                setActiveDot(null);
-                setManualDots(prev => ({ ...prev, front: { left: null, right: null } }));
-                // Keep the captured photo so user can see calibration lines
+                setManualCaptureState("front-calibration");
+                setManualDots(prev => ({
+                  ...prev,
+                  front: {
+                    shoulders: { left: null, right: null },
+                    chest: { left: null, right: null },
+                    waist: { left: null, right: null },
+                    hips: { left: null, right: null },
+                    thighs: { left: null, right: null, top: null },
+                    knee: { center: null },
+                    calves: { left: null, right: null, bottom: null }
+                  }
+                }));
               }}>
                 Back to Calibration
               </button>
-              <button 
-                onClick={() => {
-                  if (manualDots.front.left && manualDots.front.right) {
+              {(() => {
+                let placedCount = 0;
+                // Standard width measurements (2 dots each)
+                ['shoulders', 'chest', 'waist', 'hips'].forEach(type => {
+                  if (manualDots.front[type].left) placedCount++;
+                  if (manualDots.front[type].right) placedCount++;
+                });
+                // Thighs: 3 dots (left, right, top)
+                if (manualDots.front.thighs.left) placedCount++;
+                if (manualDots.front.thighs.right) placedCount++;
+                if (manualDots.front.thighs.top) placedCount++;
+                // Knee: 1 dot (center)
+                if (manualDots.front.knee.center) placedCount++;
+                // Calves: 3 dots (left, right, bottom)
+                if (manualDots.front.calves.left) placedCount++;
+                if (manualDots.front.calves.right) placedCount++;
+                if (manualDots.front.calves.bottom) placedCount++;
+                
+                const totalCount = 15; // 4*2 + 3 + 1 + 3 = 15 dots
+                
+                if (placedCount > 0) {
+                  return (
+                    <span style={{opacity: 0.7, fontSize: 12}}>
+                      {placedCount}/{totalCount} dots placed. {areAllFrontDotsPlaced() ? "✅ All placed! Drag to adjust or continue." : "Continue placing dots..."}
+                    </span>
+                  );
+                }
+                return null;
+              })()}
+              {areAllFrontDotsPlaced() && (
+                <button 
+                  onClick={() => {
                     setManualCaptureState("side-capture");
                     setCapturedDataUrl(null);
                     setTimeout(() => {
@@ -1897,15 +2764,12 @@ export default function App() {
                         videoRef.current.play().catch(err => console.error("Video play error:", err));
                       }
                     }, 100);
-                  } else {
-                    alert("Please place both left and right waist dots on the front photo.");
-                  }
-                }}
-                disabled={!manualDots.front.left || !manualDots.front.right}
-                style={{background:"#10b981", color:"white", fontWeight:"bold"}}
-              >
-                Continue to Side Photo
-              </button>
+                  }}
+                  style={{background:"#10b981", color:"white", fontWeight:"bold"}}
+                >
+                  Continue to Side Photo
+                </button>
+              )}
             </>
           )}
           {manualCaptureState === "side-capture" && (
@@ -1935,40 +2799,94 @@ export default function App() {
               </label>
             </>
           )}
-          {manualCaptureState === "side-dots" && (
+          {manualCaptureState === "side-calibration" && (
             <>
               <button onClick={() => {
                 setManualCaptureState("side-capture");
-                setActiveDot(null);
-                setManualDots(prev => ({ ...prev, side: { front: null, back: null } }));
+                setCapturedDataUrl(null);
+                setSideImageData(null);
+                setSideScaleMmPerPx(null);
+                setTimeout(() => {
+                  if (videoRef.current && streamRef.current) {
+                    videoRef.current.srcObject = streamRef.current;
+                    videoRef.current.play().catch(err => console.error("Video play error:", err));
+                  }
+                }, 100);
               }}>
                 Retake Side
               </button>
+              {sideScaleMmPerPx && (
+                <button 
+                  onClick={() => setManualCaptureState("side-dots")}
+                  style={{background:"#10b981", color:"white", fontWeight:"bold"}}
+                >
+                  Place Side Dots
+                </button>
+              )}
+            </>
+          )}
+          {manualCaptureState === "side-dots" && (
+            <>
+              <button onClick={() => {
+                setManualCaptureState("side-calibration");
+                setManualDots(prev => ({
+                  ...prev,
+                  side: {
+                    chest: { front: null, back: null },
+                    waist: { front: null, back: null },
+                    hips: { front: null, back: null },
+                    knees: { front: null, back: null },
+                    ankles: { front: null, back: null }
+                  }
+                }));
+              }}>
+                Back to Calibration
+              </button>
+              {(() => {
+                const placedCount = ['chest', 'waist', 'hips', 'thighs', 'calves'].reduce((count, type) => {
+                  if (manualDots.side[type].front) count++;
+                  if (manualDots.side[type].back) count++;
+                  return count;
+                }, 0);
+                const totalCount = 10; // 5 types * 2 dots each
+                
+                if (placedCount > 0) {
+                  return (
+                    <span style={{opacity: 0.7, fontSize: 12}}>
+                      {placedCount}/{totalCount} dots placed. {areAllSideDotsPlaced() ? "✅ All placed! Drag to adjust or calculate." : "Continue placing dots..."}
+                    </span>
+                  );
+                }
+                return null;
+              })()}
               <button 
                 onClick={handleManualSubmit}
-                disabled={!manualDots.front.left || !manualDots.front.right || !manualDots.side.front || !manualDots.side.back}
+                disabled={!areAllFrontDotsPlaced() || !areAllSideDotsPlaced()}
                 style={{background:"#10b981", color:"white", fontWeight:"bold"}}
               >
                 Calculate Measurements
               </button>
             </>
           )}
-        </div>
+      </div>
 
         {manualCaptureState !== "side-capture" && (
         <div style={{position:"relative", width:"100%", aspectRatio:"16/9", background:"black", borderRadius:12, overflow:"hidden"}}>
-          {manualCaptureState === "calibration" && !capturedDataUrl ? (
+          {manualCaptureState === "front-capture" ? (
             <video 
-              key="camera-video"
+              key="camera-video-front"
               ref={(el)=>{
                 if (el) {
                   videoRef.current = el;
                   displayRef.current = el;
-                  if (streamRef.current) {
+                  if (streamRef.current && el.srcObject !== streamRef.current) {
                     el.srcObject = streamRef.current;
                     el.onloadeddata = () => {
                       el.play().catch(err => console.error("Video play error:", err));
                     };
+                  } else if (streamRef.current) {
+                    // Stream already attached, just play
+                    el.play().catch(err => console.error("Video play error:", err));
                   }
                 }
               }} 
@@ -1978,102 +2896,429 @@ export default function App() {
               muted 
               autoPlay
             />
-          ) : manualCaptureState === "calibration" && capturedDataUrl ? (
-            <img 
-              ref={displayRef} 
-              src={capturedDataUrl} 
-              alt="Captured for Calibration" 
-              style={{width:"100%", height:"100%", objectFit:"contain"}}
-            />
-          ) : manualCaptureState === "front-dots" ? (
+          ) : manualCaptureState === "front-calibration" || manualCaptureState === "front-dots" ? (
             <img 
               ref={displayRef} 
               src={frontImageData || capturedDataUrl} 
-              alt="Captured Front" 
-              style={{width:"100%", height:"100%", objectFit:"contain", cursor: activeDot ? "crosshair" : "default"}}
-              onClick={(e) => handleManualImageClick(e, "front")}
+              alt="Front Photo" 
+              style={{width:"100%", height:"100%", objectFit:"contain", cursor: manualCaptureState === "front-dots" ? (draggingDot ? "grabbing" : "crosshair") : "default"}}
+              onClick={(e) => manualCaptureState === "front-dots" && !draggingDot && handleManualImageClick(e, "front")}
             />
-          ) : (
+          ) : manualCaptureState === "side-calibration" || manualCaptureState === "side-dots" ? (
             <img 
               ref={displayRef} 
               src={sideImageData || capturedDataUrl} 
-              alt="Captured Side" 
-              style={{width:"100%", height:"100%", objectFit:"contain", cursor: activeDot ? "crosshair" : "default"}}
-              onClick={(e) => handleManualImageClick(e, "side")}
+              alt="Side Photo" 
+              style={{width:"100%", height:"100%", objectFit:"contain", cursor: manualCaptureState === "side-dots" ? (draggingDot ? "grabbing" : "crosshair") : "default"}}
+              onClick={(e) => manualCaptureState === "side-dots" && !draggingDot && handleManualImageClick(e, "side")}
             />
-          )}
+          ) : null}
           <canvas
             ref={overlayRef}
-            style={{position:"absolute", inset:0}}
+            style={{
+              position:"absolute", 
+              inset:0, 
+              zIndex:1,
+              pointerEvents: (mode === "manual" && (manualCaptureState === "front-dots" || manualCaptureState === "side-dots")) ? "none" : "auto"
+            }}
             onPointerDown={onPointerDown}
             onPointerMove={onPointerMove}
             onPointerUp={onPointerUp}
             onPointerLeave={onPointerUp}
           />
           {/* Draw dots on front photo */}
-          {manualCaptureState === "front-dots" && frontImageData && (
-            <svg style={{position:"absolute", inset:0, pointerEvents:"none"}}>
-              {manualDots.front.left && (
-                <circle cx={(manualDots.front.left.x / capturedCanvasRef.current?.width) * (displayRef.current?.clientWidth || 960)} 
-                        cy={(manualDots.front.left.y / capturedCanvasRef.current?.height) * (displayRef.current?.clientHeight || 540)} 
-                        r="8" fill="#3b82f6" stroke="white" strokeWidth="2" />
-              )}
-              {manualDots.front.right && (
-                <circle cx={(manualDots.front.right.x / capturedCanvasRef.current?.width) * (displayRef.current?.clientWidth || 960)} 
-                        cy={(manualDots.front.right.y / capturedCanvasRef.current?.height) * (displayRef.current?.clientHeight || 540)} 
-                        r="8" fill="#ef4444" stroke="white" strokeWidth="2" />
-              )}
-              {manualDots.front.left && manualDots.front.right && (
-                <line 
-                  x1={(manualDots.front.left.x / capturedCanvasRef.current?.width) * (displayRef.current?.clientWidth || 960)}
-                  y1={(manualDots.front.left.y / capturedCanvasRef.current?.height) * (displayRef.current?.clientHeight || 540)}
-                  x2={(manualDots.front.right.x / capturedCanvasRef.current?.width) * (displayRef.current?.clientWidth || 960)}
-                  y2={(manualDots.front.right.y / capturedCanvasRef.current?.height) * (displayRef.current?.clientHeight || 540)}
-                  stroke="#10b981" strokeWidth="2" strokeDasharray="5,5"
-                />
-              )}
-            </svg>
-          )}
+          {manualCaptureState === "front-dots" && frontImageData && (() => {
+            const img = displayRef.current;
+            if (!img || !img.complete) return null;
+            const imgRect = img.getBoundingClientRect();
+            const containerRect = img.parentElement?.getBoundingClientRect();
+            if (!containerRect) return null;
+            
+            const imageWidth = capturedCanvasRef.current?.width || img.naturalWidth || img.width;
+            const imageHeight = capturedCanvasRef.current?.height || img.naturalHeight || img.height;
+            const scaleX = imgRect.width / imageWidth;
+            const scaleY = imgRect.height / imageHeight;
+            const offsetX = (containerRect.width - imgRect.width) / 2;
+            const offsetY = (containerRect.height - imgRect.height) / 2;
+            
+            // Check if any dots are placed
+            const hasAnyDots = 
+              ['shoulders', 'chest', 'waist', 'hips'].some(type => 
+                manualDots.front[type].left || manualDots.front[type].right
+              ) ||
+              manualDots.front.thighs.left || manualDots.front.thighs.right || manualDots.front.thighs.top ||
+              manualDots.front.knee.center ||
+              manualDots.front.calves.left || manualDots.front.calves.right || manualDots.front.calves.bottom;
+            
+            if (!hasAnyDots) return null;
+            
+            return (
+              <svg style={{position:"absolute", inset:0, pointerEvents:"none", zIndex:2, width:"100%", height:"100%"}}>
+                {/* Standard width measurements (shoulders, chest, waist, hips) */}
+                {['shoulders', 'chest', 'waist', 'hips'].map(type => {
+                  const leftDot = manualDots.front[type].left;
+                  const rightDot = manualDots.front[type].right;
+                  
+                  return (
+                    <g key={type}>
+                      {leftDot && (() => {
+                        const cx = offsetX + (leftDot.x * scaleX);
+                        const cy = offsetY + (leftDot.y * scaleY);
+                        const isDragging = draggingDot === `${type}-left`;
+                        
+                        return (
+                          <circle 
+                            cx={cx} 
+                            cy={cy} 
+                            r={isDragging ? "5" : "4"} 
+                            fill={getDotColor("front", type, "left")} 
+                            stroke="white" 
+                            strokeWidth={isDragging ? "2" : "1.5"} 
+                            opacity={isDragging ? 0.9 : 1}
+                            style={{cursor: "grab", pointerEvents: "auto"}}
+                            onPointerDown={(e) => {
+                              e.stopPropagation();
+                              setDraggingDot(`${type}-left`);
+                            }}
+                          />
+                        );
+                      })()}
+                      {rightDot && (() => {
+                        const cx = offsetX + (rightDot.x * scaleX);
+                        const cy = offsetY + (rightDot.y * scaleY);
+                        const isDragging = draggingDot === `${type}-right`;
+                        
+                        return (
+                          <circle 
+                            cx={cx} 
+                            cy={cy} 
+                            r={isDragging ? "5" : "4"} 
+                            fill={getDotColor("front", type, "right")} 
+                            stroke="white" 
+                            strokeWidth={isDragging ? "2" : "1.5"} 
+                            opacity={isDragging ? 0.9 : 1}
+                            style={{cursor: "grab", pointerEvents: "auto"}}
+                            onPointerDown={(e) => {
+                              e.stopPropagation();
+                              setDraggingDot(`${type}-right`);
+                            }}
+                          />
+                        );
+                      })()}
+                      {leftDot && rightDot && (
+                        <line 
+                          x1={offsetX + (leftDot.x * scaleX)} 
+                          y1={offsetY + (leftDot.y * scaleY)} 
+                          x2={offsetX + (rightDot.x * scaleX)} 
+                          y2={offsetY + (rightDot.y * scaleY)} 
+                          stroke={getDotColor("front", type, "left")} 
+                          strokeWidth="1.5" 
+                          strokeDasharray="3,3" 
+                          opacity="0.6"
+                        />
+                      )}
+                    </g>
+                  );
+                })}
+                
+                {/* Thigh measurements: thickness (left/right) and length (top to knee) */}
+                <g key="thighs">
+                  {manualDots.front.thighs.left && (() => {
+                    const dot = manualDots.front.thighs.left;
+                    const cx = offsetX + (dot.x * scaleX);
+                    const cy = offsetY + (dot.y * scaleY);
+                    const isDragging = draggingDot === 'thighs-left';
+                    return (
+                      <circle 
+                        cx={cx} cy={cy} 
+                        r={isDragging ? "5" : "4"} 
+                        fill={getDotColor("front", "thighs", "left")} 
+                        stroke="white" 
+                        strokeWidth={isDragging ? "2" : "1.5"} 
+                        opacity={isDragging ? 0.9 : 1}
+                        style={{cursor: "grab", pointerEvents: "auto"}}
+                        onPointerDown={(e) => { e.stopPropagation(); setDraggingDot('thighs-left'); }}
+                      />
+                    );
+                  })()}
+                  {manualDots.front.thighs.right && (() => {
+                    const dot = manualDots.front.thighs.right;
+                    const cx = offsetX + (dot.x * scaleX);
+                    const cy = offsetY + (dot.y * scaleY);
+                    const isDragging = draggingDot === 'thighs-right';
+                    return (
+                      <circle 
+                        cx={cx} cy={cy} 
+                        r={isDragging ? "5" : "4"} 
+                        fill={getDotColor("front", "thighs", "right")} 
+                        stroke="white" 
+                        strokeWidth={isDragging ? "2" : "1.5"} 
+                        opacity={isDragging ? 0.9 : 1}
+                        style={{cursor: "grab", pointerEvents: "auto"}}
+                        onPointerDown={(e) => { e.stopPropagation(); setDraggingDot('thighs-right'); }}
+                      />
+                    );
+                  })()}
+                  {manualDots.front.thighs.left && manualDots.front.thighs.right && (
+                    <line 
+                      x1={offsetX + (manualDots.front.thighs.left.x * scaleX)} 
+                      y1={offsetY + (manualDots.front.thighs.left.y * scaleY)} 
+                      x2={offsetX + (manualDots.front.thighs.right.x * scaleX)} 
+                      y2={offsetY + (manualDots.front.thighs.right.y * scaleY)} 
+                      stroke={getDotColor("front", "thighs", "left")} 
+                      strokeWidth="1.5" 
+                      strokeDasharray="3,3" 
+                      opacity="0.6"
+                    />
+                  )}
+                  {manualDots.front.thighs.top && (() => {
+                    const dot = manualDots.front.thighs.top;
+                    const cx = offsetX + (dot.x * scaleX);
+                    const cy = offsetY + (dot.y * scaleY);
+                    const isDragging = draggingDot === 'thighs-top';
+                    return (
+                      <circle 
+                        cx={cx} cy={cy} 
+                        r={isDragging ? "5" : "4"} 
+                        fill={getDotColor("front", "thighs", "top")} 
+                        stroke="white" 
+                        strokeWidth={isDragging ? "2" : "1.5"} 
+                        opacity={isDragging ? 0.9 : 1}
+                        style={{cursor: "grab", pointerEvents: "auto"}}
+                        onPointerDown={(e) => { e.stopPropagation(); setDraggingDot('thighs-top'); }}
+                      />
+                    );
+                  })()}
+                  {/* Line from thigh top to knee for upper leg length */}
+                  {manualDots.front.thighs.top && manualDots.front.knee.center && (
+                    <line 
+                      x1={offsetX + (manualDots.front.thighs.top.x * scaleX)} 
+                      y1={offsetY + (manualDots.front.thighs.top.y * scaleY)} 
+                      x2={offsetX + (manualDots.front.knee.center.x * scaleX)} 
+                      y2={offsetY + (manualDots.front.knee.center.y * scaleY)} 
+                      stroke={getDotColor("front", "thighs", "top")} 
+                      strokeWidth="1.5" 
+                      strokeDasharray="3,3" 
+                      opacity="0.6"
+                    />
+                  )}
+                </g>
+                
+                {/* Knee center point */}
+                {manualDots.front.knee.center && (() => {
+                  const dot = manualDots.front.knee.center;
+                  const cx = offsetX + (dot.x * scaleX);
+                  const cy = offsetY + (dot.y * scaleY);
+                  const isDragging = draggingDot === 'knee-center';
+                  return (
+                    <circle 
+                      cx={cx} cy={cy} 
+                      r={isDragging ? "5" : "4"} 
+                      fill={getDotColor("front", "knee", "center")} 
+                      stroke="white" 
+                      strokeWidth={isDragging ? "2" : "1.5"} 
+                      opacity={isDragging ? 0.9 : 1}
+                      style={{cursor: "grab", pointerEvents: "auto"}}
+                      onPointerDown={(e) => { e.stopPropagation(); setDraggingDot('knee-center'); }}
+                    />
+                  );
+                })()}
+                
+                {/* Calf measurements: thickness (left/right) and length (knee to ankle) */}
+                <g key="calves">
+                  {manualDots.front.calves.left && (() => {
+                    const dot = manualDots.front.calves.left;
+                    const cx = offsetX + (dot.x * scaleX);
+                    const cy = offsetY + (dot.y * scaleY);
+                    const isDragging = draggingDot === 'calves-left';
+                    return (
+                      <circle 
+                        cx={cx} cy={cy} 
+                        r={isDragging ? "5" : "4"} 
+                        fill={getDotColor("front", "calves", "left")} 
+                        stroke="white" 
+                        strokeWidth={isDragging ? "2" : "1.5"} 
+                        opacity={isDragging ? 0.9 : 1}
+                        style={{cursor: "grab", pointerEvents: "auto"}}
+                        onPointerDown={(e) => { e.stopPropagation(); setDraggingDot('calves-left'); }}
+                      />
+                    );
+                  })()}
+                  {manualDots.front.calves.right && (() => {
+                    const dot = manualDots.front.calves.right;
+                    const cx = offsetX + (dot.x * scaleX);
+                    const cy = offsetY + (dot.y * scaleY);
+                    const isDragging = draggingDot === 'calves-right';
+                    return (
+                      <circle 
+                        cx={cx} cy={cy} 
+                        r={isDragging ? "5" : "4"} 
+                        fill={getDotColor("front", "calves", "right")} 
+                        stroke="white" 
+                        strokeWidth={isDragging ? "2" : "1.5"} 
+                        opacity={isDragging ? 0.9 : 1}
+                        style={{cursor: "grab", pointerEvents: "auto"}}
+                        onPointerDown={(e) => { e.stopPropagation(); setDraggingDot('calves-right'); }}
+                      />
+                    );
+                  })()}
+                  {manualDots.front.calves.left && manualDots.front.calves.right && (
+                    <line 
+                      x1={offsetX + (manualDots.front.calves.left.x * scaleX)} 
+                      y1={offsetY + (manualDots.front.calves.left.y * scaleY)} 
+                      x2={offsetX + (manualDots.front.calves.right.x * scaleX)} 
+                      y2={offsetY + (manualDots.front.calves.right.y * scaleY)} 
+                      stroke={getDotColor("front", "calves", "left")} 
+                      strokeWidth="1.5" 
+                      strokeDasharray="3,3" 
+                      opacity="0.6"
+                    />
+                  )}
+                  {manualDots.front.calves.bottom && (() => {
+                    const dot = manualDots.front.calves.bottom;
+                    const cx = offsetX + (dot.x * scaleX);
+                    const cy = offsetY + (dot.y * scaleY);
+                    const isDragging = draggingDot === 'calves-bottom';
+                    return (
+                      <circle 
+                        cx={cx} cy={cy} 
+                        r={isDragging ? "5" : "4"} 
+                        fill={getDotColor("front", "calves", "bottom")} 
+                        stroke="white" 
+                        strokeWidth={isDragging ? "2" : "1.5"} 
+                        opacity={isDragging ? 0.9 : 1}
+                        style={{cursor: "grab", pointerEvents: "auto"}}
+                        onPointerDown={(e) => { e.stopPropagation(); setDraggingDot('calves-bottom'); }}
+                      />
+                    );
+                  })()}
+                  {/* Line from knee to ankle for lower leg length */}
+                  {manualDots.front.knee.center && manualDots.front.calves.bottom && (
+                    <line 
+                      x1={offsetX + (manualDots.front.knee.center.x * scaleX)} 
+                      y1={offsetY + (manualDots.front.knee.center.y * scaleY)} 
+                      x2={offsetX + (manualDots.front.calves.bottom.x * scaleX)} 
+                      y2={offsetY + (manualDots.front.calves.bottom.y * scaleY)} 
+                      stroke={getDotColor("front", "calves", "bottom")} 
+                      strokeWidth="1.5" 
+                      strokeDasharray="3,3" 
+                      opacity="0.6"
+                    />
+                  )}
+                </g>
+              </svg>
+            );
+          })()}
           {/* Draw dots on side photo */}
-          {manualCaptureState === "side-dots" && sideImageData && (
-            <svg style={{position:"absolute", inset:0, pointerEvents:"none"}}>
-              {manualDots.side.front && (
-                <circle cx={(manualDots.side.front.x / capturedCanvasRef.current?.width) * (displayRef.current?.clientWidth || 960)} 
-                        cy={(manualDots.side.front.y / capturedCanvasRef.current?.height) * (displayRef.current?.clientHeight || 540)} 
-                        r="8" fill="#f59e0b" stroke="white" strokeWidth="2" />
-              )}
-              {manualDots.side.back && (
-                <circle cx={(manualDots.side.back.x / capturedCanvasRef.current?.width) * (displayRef.current?.clientWidth || 960)} 
-                        cy={(manualDots.side.back.y / capturedCanvasRef.current?.height) * (displayRef.current?.clientHeight || 540)} 
-                        r="8" fill="#8b5cf6" stroke="white" strokeWidth="2" />
-              )}
-              {manualDots.side.front && manualDots.side.back && (
-                <line 
-                  x1={(manualDots.side.front.x / capturedCanvasRef.current?.width) * (displayRef.current?.clientWidth || 960)}
-                  y1={(manualDots.side.front.y / capturedCanvasRef.current?.height) * (displayRef.current?.clientHeight || 540)}
-                  x2={(manualDots.side.back.x / capturedCanvasRef.current?.width) * (displayRef.current?.clientWidth || 960)}
-                  y2={(manualDots.side.back.y / capturedCanvasRef.current?.height) * (displayRef.current?.clientHeight || 540)}
-                  stroke="#10b981" strokeWidth="2" strokeDasharray="5,5"
-                />
-              )}
-            </svg>
-          )}
+          {manualCaptureState === "side-dots" && sideImageData && (() => {
+            const img = displayRef.current;
+            if (!img || !img.complete) return null;
+            const imgRect = img.getBoundingClientRect();
+            const containerRect = img.parentElement?.getBoundingClientRect();
+            if (!containerRect) return null;
+            
+            const imageWidth = capturedCanvasRef.current?.width || img.naturalWidth || img.width;
+            const imageHeight = capturedCanvasRef.current?.height || img.naturalHeight || img.height;
+            const scaleX = imgRect.width / imageWidth;
+            const scaleY = imgRect.height / imageHeight;
+            const offsetX = (containerRect.width - imgRect.width) / 2;
+            const offsetY = (containerRect.height - imgRect.height) / 2;
+            
+            const hasAnyDots = ['chest', 'waist', 'hips', 'thighs', 'calves'].some(type => 
+              manualDots.side[type].front || manualDots.side[type].back
+            );
+            
+            if (!hasAnyDots) return null;
+            
+            return (
+              <svg style={{position:"absolute", inset:0, pointerEvents:"none", zIndex:2, width:"100%", height:"100%"}}>
+                {['chest', 'waist', 'hips', 'thighs', 'calves'].map(type => {
+                  const frontDot = manualDots.side[type].front;
+                  const backDot = manualDots.side[type].back;
+                  
+                  return (
+                    <g key={type}>
+                      {frontDot && (() => {
+                        const cx = offsetX + (frontDot.x * scaleX);
+                        const cy = offsetY + (frontDot.y * scaleY);
+                        const isDragging = draggingDot === `${type}-front`;
+                        
+                        return (
+                          <circle 
+                            cx={cx} 
+                            cy={cy} 
+                            r={isDragging ? "5" : "4"} 
+                            fill={getDotColor("side", type, "front")} 
+                            stroke="white" 
+                            strokeWidth={isDragging ? "2" : "1.5"} 
+                            opacity={isDragging ? 0.9 : 1}
+                            style={{cursor: "grab", pointerEvents: "auto"}}
+                            onPointerDown={(e) => {
+                              e.stopPropagation();
+                              setDraggingDot(`${type}-front`);
+                            }}
+                          />
+                        );
+                      })()}
+                      {backDot && (() => {
+                        const cx = offsetX + (backDot.x * scaleX);
+                        const cy = offsetY + (backDot.y * scaleY);
+                        const isDragging = draggingDot === `${type}-back`;
+                        
+                        return (
+                          <circle 
+                            cx={cx} 
+                            cy={cy} 
+                            r={isDragging ? "5" : "4"} 
+                            fill={getDotColor("side", type, "back")} 
+                            stroke="white" 
+                            strokeWidth={isDragging ? "2" : "1.5"} 
+                            opacity={isDragging ? 0.9 : 1}
+                            style={{cursor: "grab", pointerEvents: "auto"}}
+                            onPointerDown={(e) => {
+                              e.stopPropagation();
+                              setDraggingDot(`${type}-back`);
+                            }}
+                          />
+                        );
+                      })()}
+                      {frontDot && backDot && (
+                        <line 
+                          x1={offsetX + (frontDot.x * scaleX)} 
+                          y1={offsetY + (frontDot.y * scaleY)} 
+                          x2={offsetX + (backDot.x * scaleX)} 
+                          y2={offsetY + (backDot.y * scaleY)} 
+                          stroke={getDotColor("side", type, "front")} 
+                          strokeWidth="1.5" 
+                          strokeDasharray="3,3" 
+                          opacity="0.6"
+                        />
+                      )}
+                    </g>
+                  );
+                })}
+              </svg>
+            );
+          })()}
         </div>
         )}
 
         {manualCaptureState === "side-capture" && (
         <div style={{position:"relative", width:"100%", aspectRatio:"16/9", background:"black", borderRadius:12, overflow:"hidden"}}>
           <video 
-            key="camera-video"
+            key="camera-video-side"
             ref={(el)=>{
               if (el) {
                 videoRef.current = el;
                 displayRef.current = el;
-                if (streamRef.current) {
+                if (streamRef.current && el.srcObject !== streamRef.current) {
                   el.srcObject = streamRef.current;
                   el.onloadeddata = () => {
                     el.play().catch(err => console.error("Video play error:", err));
                   };
+                } else if (streamRef.current) {
+                  // Stream already attached, just play
+                  el.play().catch(err => console.error("Video play error:", err));
                 }
               }
             }} 
@@ -2095,13 +3340,121 @@ export default function App() {
         )}
 
         <p style={{opacity:0.7, fontSize:12, marginTop:8}}>
-          {manualCaptureState === "front-dots" && activeDot === "left" && "📍 Click on LEFT waist point (blue dot)"}
-          {manualCaptureState === "front-dots" && activeDot === "right" && "📍 Click on RIGHT waist point (red dot)"}
-          {manualCaptureState === "front-dots" && !activeDot && "✅ Both waist points placed. Click 'Continue to Side Photo'."}
-          {manualCaptureState === "side-dots" && activeDot === "front" && "📍 Click on FRONT waist point (orange dot)"}
-          {manualCaptureState === "side-dots" && activeDot === "back" && "📍 Click on BACK waist point (purple dot)"}
-          {manualCaptureState === "side-dots" && !activeDot && "✅ Both waist points placed. Click 'Calculate Measurements'."}
-          {(manualCaptureState === "calibration" || manualCaptureState === "side-capture") && "Tips: phone level, subject centered, full body visible."}
+          {manualCaptureState === "front-capture" && "📸 Capture or upload front photo. Then calibrate with head/heel lines."}
+          {manualCaptureState === "front-calibration" && "↕️ Drag the blue lines to mark head and heel positions, then lock scale."}
+          {manualCaptureState === "front-dots" && (() => {
+            const nextDot = getNextFrontDot();
+            const typeNames = {
+              shoulders: "Shoulders",
+              chest: "Chest",
+              waist: "Waist",
+              hips: "Hips",
+              thighs: "Thighs",
+              knee: "Knee",
+              calves: "Calves"
+            };
+            
+            if (!nextDot) {
+              return (
+                <>
+                  <strong style={{color: "#10b981", fontSize: 14}}>✅ All front dots placed!</strong>
+                  <br />
+                  Drag any dot to adjust, or continue to side photo.
+                </>
+              );
+            }
+            
+            const color = getDotColor("front", nextDot.type, nextDot.side);
+            
+            if (nextDot.type === "thighs") {
+              if (nextDot.side === "left" || nextDot.side === "right") {
+                return (
+                  <>
+                    <strong style={{color: "#60a5fa", fontSize: 14}}>📍 Place Thighs dots (thickness)</strong>
+                    <br />
+                    Click on the <strong style={{color}}>{nextDot.side.toUpperCase()}</strong> side of the thigh ({nextDot.side === "left" ? "first" : "second"} dot)
+                  </>
+                );
+              } else if (nextDot.side === "top") {
+                return (
+                  <>
+                    <strong style={{color: "#60a5fa", fontSize: 14}}>📍 Place Thigh top dot (for length)</strong>
+                    <br />
+                    Click at the <strong style={{color}}>TOP</strong> of the thigh (where leg starts, for upper leg length)
+                  </>
+                );
+              }
+            } else if (nextDot.type === "knee") {
+              return (
+                <>
+                  <strong style={{color: "#60a5fa", fontSize: 14}}>📍 Place Knee center dot</strong>
+                  <br />
+                  Click at the <strong style={{color}}>CENTER</strong> of the knee (midpoint for leg length)
+                </>
+              );
+            } else if (nextDot.type === "calves") {
+              if (nextDot.side === "left" || nextDot.side === "right") {
+                return (
+                  <>
+                    <strong style={{color: "#60a5fa", fontSize: 14}}>📍 Place Calves dots (thickness)</strong>
+                    <br />
+                    Click on the <strong style={{color}}>{nextDot.side.toUpperCase()}</strong> side of the calf ({nextDot.side === "left" ? "first" : "second"} dot)
+                  </>
+                );
+              } else if (nextDot.side === "bottom") {
+                return (
+                  <>
+                    <strong style={{color: "#60a5fa", fontSize: 14}}>📍 Place Ankle dot (for length)</strong>
+                    <br />
+                    Click at the <strong style={{color}}>ANKLE</strong> (bottom of calf, for lower leg length)
+                  </>
+                );
+              }
+            } else {
+              // Standard width measurements
+              const sideText = nextDot.side === "left" ? "LEFT" : "RIGHT";
+              return (
+                <>
+                  <strong style={{color: "#60a5fa", fontSize: 14}}>📍 Place {typeNames[nextDot.type]} dots</strong>
+                  <br />
+                  Click on the <strong style={{color}}>{sideText}</strong> side of the {typeNames[nextDot.type].toLowerCase()} ({nextDot.side === "left" ? "first" : "second"} dot)
+                </>
+              );
+            }
+          })()}
+          {manualCaptureState === "side-capture" && "📸 Capture or upload side photo. Then calibrate with head/heel lines."}
+          {manualCaptureState === "side-calibration" && "↕️ Drag the blue lines to mark head and heel positions, then lock scale."}
+          {manualCaptureState === "side-dots" && (() => {
+            const nextDot = getNextSideDot();
+            const typeNames = {
+              chest: "Chest",
+              waist: "Waist",
+              hips: "Hips",
+              thighs: "Thighs",
+              calves: "Calves"
+            };
+            
+            if (!nextDot) {
+              return (
+                <>
+                  <strong style={{color: "#10b981", fontSize: 14}}>✅ All side dots placed!</strong>
+                  <br />
+                  Drag any dot to adjust, or calculate measurements.
+                </>
+              );
+            }
+            
+            const sideText = nextDot.side === "front" ? "FRONT" : "BACK";
+            const color = getDotColor("side", nextDot.type, nextDot.side);
+            
+            return (
+              <>
+                <strong style={{color: "#60a5fa", fontSize: 14}}>📍 Place {typeNames[nextDot.type]} dots</strong>
+                <br />
+                Click on the <strong style={{color}}>{sideText}</strong> of the {typeNames[nextDot.type].toLowerCase()} ({nextDot.side === "front" ? "first" : "second"} dot)
+              </>
+            );
+          })()}
         </p>
           </>
         )}
@@ -2160,52 +3513,161 @@ export default function App() {
             borderRadius: 12,
             border: "1px solid #374151"
           }}>
-            <h2 style={{margin: "0 0 16px 0", fontSize: 20}}>Detected Body Measurements</h2>
+            <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16}}>
+              <h2 style={{margin: 0, fontSize: 20}}>Detected Body Measurements</h2>
+              <button
+                onClick={() => setUseInches(!useInches)}
+                style={{
+                  padding: "8px 16px",
+                  background: useInches ? "#3b82f6" : "#374151",
+                  color: "white",
+                  border: "none",
+                  borderRadius: "6px",
+                  cursor: "pointer",
+                  fontSize: 14,
+                  fontWeight: "bold"
+                }}
+              >
+                {useInches ? "Show CM" : "Show Inches"}
+              </button>
+            </div>
             
             {bodyMeasurements.height && (
               <div style={{marginBottom: 12, paddingBottom: 12, borderBottom: "1px solid #374151"}}>
-                <strong>Height:</strong> {bodyMeasurements.height.cm} cm ({bodyMeasurements.height.mm} mm)
+                <strong>Height:</strong> {formatMeasurement(bodyMeasurements.height.cm).main}
+                {formatMeasurement(bodyMeasurements.height.cm).sub && (
+                  <span style={{opacity: 0.7, fontSize: 12, marginLeft: 8}}>
+                    ({formatMeasurement(bodyMeasurements.height.cm).sub})
+                  </span>
+                )}
               </div>
             )}
 
-            {/* Manual Drawing Mode: Display waist measurement */}
-            {mode === "manual" && bodyMeasurements.waist && (
-              <div style={{
-                marginBottom: 20,
-                padding: 16,
-                background: "#111827",
-                borderRadius: 8,
-                border: "1px solid #374151"
-              }}>
-                <h3 style={{margin: "0 0 12px 0", fontSize: 16, textTransform: "capitalize"}}>Waist</h3>
-                <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12}}>
-                  <div>
-                    <div style={{fontSize: 11, opacity: 0.7, marginBottom: 4}}>Width (Front)</div>
-                    <div style={{fontSize: 18, fontWeight: "bold"}}>{bodyMeasurements.waist.width.cm} cm</div>
-                    <div style={{fontSize: 11, opacity: 0.6}}>{bodyMeasurements.waist.width.mm} mm</div>
-                  </div>
-                  <div>
-                    <div style={{fontSize: 11, opacity: 0.7, marginBottom: 4}}>Depth (Side)</div>
-                    <div style={{fontSize: 18, fontWeight: "bold"}}>{bodyMeasurements.waist.depth.cm} cm</div>
-                    <div style={{fontSize: 11, opacity: 0.6}}>{bodyMeasurements.waist.depth.mm} mm</div>
-                  </div>
-                </div>
-                
-                {/* 3D Calculations */}
-                <div style={{marginTop: 12, paddingTop: 12, borderTop: "1px solid #374151"}}>
-                  <div style={{fontSize: 12, opacity: 0.7, marginBottom: 8}}>3D Measurements</div>
-                  <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 8}}>
+            {/* Manual Drawing Mode: Display all measurements */}
+            {mode === "manual" && (
+              <>
+                {/* Display shoulders width (only width, no depth) */}
+                {bodyMeasurements.widths?.shoulders && (
+                  <div style={{
+                    marginBottom: 20,
+                    padding: 16,
+                    background: "#111827",
+                    borderRadius: 8,
+                    border: "1px solid #374151"
+                  }}>
+                    <h3 style={{margin: "0 0 12px 0", fontSize: 16, textTransform: "capitalize"}}>Shoulders</h3>
                     <div>
-                      <div style={{fontSize: 10, opacity: 0.6}}>Circumference</div>
-                      <div style={{fontSize: 14, fontWeight: "bold"}}>{bodyMeasurements.waist.circumference.cm} cm</div>
-                    </div>
-                    <div>
-                      <div style={{fontSize: 10, opacity: 0.6}}>Cross-Section</div>
-                      <div style={{fontSize: 14, fontWeight: "bold"}}>{bodyMeasurements.waist.crossSectionalArea.cm2} cm²</div>
+                      <div style={{fontSize: 11, opacity: 0.7, marginBottom: 4}}>Width (Front)</div>
+                      <div style={{fontSize: 18, fontWeight: "bold"}}>{formatMeasurement(bodyMeasurements.widths.shoulders.cm).main}</div>
+                      {formatMeasurement(bodyMeasurements.widths.shoulders.cm).sub && (
+                        <div style={{fontSize: 11, opacity: 0.6}}>{formatMeasurement(bodyMeasurements.widths.shoulders.cm).sub}</div>
+                      )}
                     </div>
                   </div>
-                </div>
-              </div>
+                )}
+
+                {["chest", "waist", "hips", "thighs", "calves"].map(landmark => {
+                  const measurement = bodyMeasurements[landmark];
+                  if (!measurement) return null;
+
+                  return (
+                    <div key={landmark} style={{
+                      marginBottom: 20,
+                      padding: 16,
+                      background: "#111827",
+                      borderRadius: 8,
+                      border: "1px solid #374151"
+                    }}>
+                      <h3 style={{margin: "0 0 12px 0", fontSize: 16, textTransform: "capitalize"}}>{landmark}</h3>
+                      <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12}}>
+                        <div>
+                          <div style={{fontSize: 11, opacity: 0.7, marginBottom: 4}}>Width (Front)</div>
+                          <div style={{fontSize: 18, fontWeight: "bold"}}>{formatMeasurement(measurement.width.cm).main}</div>
+                          {formatMeasurement(measurement.width.cm).sub && (
+                            <div style={{fontSize: 11, opacity: 0.6}}>{formatMeasurement(measurement.width.cm).sub}</div>
+                          )}
+                        </div>
+                        <div>
+                          <div style={{fontSize: 11, opacity: 0.7, marginBottom: 4}}>Depth (Side)</div>
+                          <div style={{fontSize: 18, fontWeight: "bold"}}>{formatMeasurement(measurement.depth.cm).main}</div>
+                          {formatMeasurement(measurement.depth.cm).sub && (
+                            <div style={{fontSize: 11, opacity: 0.6}}>{formatMeasurement(measurement.depth.cm).sub}</div>
+                          )}
+                        </div>
+                      </div>
+                      
+                      {/* 3D Calculations */}
+                      <div style={{marginTop: 12, paddingTop: 12, borderTop: "1px solid #374151"}}>
+                        <div style={{fontSize: 12, opacity: 0.7, marginBottom: 8}}>3D Measurements</div>
+                        <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 8}}>
+                          <div>
+                            <div style={{fontSize: 10, opacity: 0.6}}>Circumference</div>
+                            <div style={{fontSize: 14, fontWeight: "bold"}}>{formatMeasurement(measurement.circumference.cm).main}</div>
+                            {formatMeasurement(measurement.circumference.cm).sub && (
+                              <div style={{fontSize: 9, opacity: 0.5}}>{formatMeasurement(measurement.circumference.cm).sub}</div>
+                            )}
+                          </div>
+                          <div>
+                            <div style={{fontSize: 10, opacity: 0.6}}>Cross-Section</div>
+                            <div style={{fontSize: 14, fontWeight: "bold"}}>{formatMeasurement(measurement.crossSectionalArea.cm2, "area").main}</div>
+                            {formatMeasurement(measurement.crossSectionalArea.cm2, "area").sub && (
+                              <div style={{fontSize: 9, opacity: 0.5}}>{formatMeasurement(measurement.crossSectionalArea.cm2, "area").sub}</div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+
+                {/* Display leg length measurements */}
+                {(bodyMeasurements.upperLegLength || bodyMeasurements.lowerLegLength || bodyMeasurements.totalLegLength) && (
+                  <div style={{
+                    marginBottom: 20,
+                    padding: 16,
+                    background: "#111827",
+                    borderRadius: 8,
+                    border: "1px solid #374151"
+                  }}>
+                    <h3 style={{margin: "0 0 12px 0", fontSize: 16}}>Leg Lengths</h3>
+                    <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12}}>
+                      {bodyMeasurements.upperLegLength && (
+                        <div>
+                          <div style={{fontSize: 11, opacity: 0.7, marginBottom: 4}}>Upper Leg (Thigh to Knee)</div>
+                          <div style={{fontSize: 18, fontWeight: "bold"}}>{formatMeasurement(bodyMeasurements.upperLegLength.cm).main}</div>
+                          {formatMeasurement(bodyMeasurements.upperLegLength.cm).sub && (
+                            <div style={{fontSize: 11, opacity: 0.6}}>{formatMeasurement(bodyMeasurements.upperLegLength.cm).sub}</div>
+                          )}
+                        </div>
+                      )}
+                      {bodyMeasurements.lowerLegLength && (
+                        <div>
+                          <div style={{fontSize: 11, opacity: 0.7, marginBottom: 4}}>Lower Leg (Knee to Ankle)</div>
+                          <div style={{fontSize: 18, fontWeight: "bold"}}>{formatMeasurement(bodyMeasurements.lowerLegLength.cm).main}</div>
+                          {formatMeasurement(bodyMeasurements.lowerLegLength.cm).sub && (
+                            <div style={{fontSize: 11, opacity: 0.6}}>{formatMeasurement(bodyMeasurements.lowerLegLength.cm).sub}</div>
+                          )}
+                        </div>
+                      )}
+                      {bodyMeasurements.totalLegLength && (
+                        <div>
+                          <div style={{fontSize: 11, opacity: 0.7, marginBottom: 4}}>Total Leg Length</div>
+                          <div style={{fontSize: 18, fontWeight: "bold"}}>{formatMeasurement(bodyMeasurements.totalLegLength.cm).main}</div>
+                          {formatMeasurement(bodyMeasurements.totalLegLength.cm).sub && (
+                            <div style={{fontSize: 11, opacity: 0.6}}>{formatMeasurement(bodyMeasurements.totalLegLength.cm).sub}</div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {(!bodyMeasurements.chest && !bodyMeasurements.waist && !bodyMeasurements.hips && !bodyMeasurements.thighs && !bodyMeasurements.calves) && (
+                  <p style={{opacity: 0.7, fontSize: 14, marginTop: 12}}>
+                    No measurements calculated. Please place all dots and calculate measurements.
+                  </p>
+                )}
+              </>
             )}
 
             {/* Pose Estimation Mode: Display all landmarks */}
@@ -2227,13 +3689,17 @@ export default function App() {
                       <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12}}>
                         <div>
                           <div style={{fontSize: 11, opacity: 0.7, marginBottom: 4}}>Width (Front)</div>
-                          <div style={{fontSize: 18, fontWeight: "bold"}}>{measurement.width.cm} cm</div>
-                          <div style={{fontSize: 11, opacity: 0.6}}>{measurement.width.mm} mm</div>
+                          <div style={{fontSize: 18, fontWeight: "bold"}}>{formatMeasurement(measurement.width.cm).main}</div>
+                          {formatMeasurement(measurement.width.cm).sub && (
+                            <div style={{fontSize: 11, opacity: 0.6}}>{formatMeasurement(measurement.width.cm).sub}</div>
+                          )}
                         </div>
                         <div>
                           <div style={{fontSize: 11, opacity: 0.7, marginBottom: 4}}>Depth (Side)</div>
-                          <div style={{fontSize: 18, fontWeight: "bold"}}>{measurement.depth.cm} cm</div>
-                          <div style={{fontSize: 11, opacity: 0.6}}>{measurement.depth.mm} mm</div>
+                          <div style={{fontSize: 18, fontWeight: "bold"}}>{formatMeasurement(measurement.depth.cm).main}</div>
+                          {formatMeasurement(measurement.depth.cm).sub && (
+                            <div style={{fontSize: 11, opacity: 0.6}}>{formatMeasurement(measurement.depth.cm).sub}</div>
+                          )}
                         </div>
                       </div>
                       
@@ -2243,16 +3709,22 @@ export default function App() {
                         <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 8}}>
                           <div>
                             <div style={{fontSize: 10, opacity: 0.6}}>Circumference</div>
-                            <div style={{fontSize: 14, fontWeight: "bold"}}>{measurement.circumference.cm} cm</div>
+                            <div style={{fontSize: 14, fontWeight: "bold"}}>{formatMeasurement(measurement.circumference.cm).main}</div>
+                            {formatMeasurement(measurement.circumference.cm).sub && (
+                              <div style={{fontSize: 9, opacity: 0.5}}>{formatMeasurement(measurement.circumference.cm).sub}</div>
+                            )}
                           </div>
                           <div>
                             <div style={{fontSize: 10, opacity: 0.6}}>Cross-Section</div>
-                            <div style={{fontSize: 14, fontWeight: "bold"}}>{measurement.crossSectionalArea.cm2} cm²</div>
+                            <div style={{fontSize: 14, fontWeight: "bold"}}>{formatMeasurement(measurement.crossSectionalArea.cm2, "area").main}</div>
+                            {formatMeasurement(measurement.crossSectionalArea.cm2, "area").sub && (
+                              <div style={{fontSize: 9, opacity: 0.5}}>{formatMeasurement(measurement.crossSectionalArea.cm2, "area").sub}</div>
+                            )}
                           </div>
                           <div>
                             <div style={{fontSize: 10, opacity: 0.6}}>Volume</div>
                             <div style={{fontSize: 14, fontWeight: "bold"}}>{measurement.volume.liters} L</div>
-                            <div style={{fontSize: 9, opacity: 0.5}}>{measurement.volume.cm3} cm³</div>
+                            <div style={{fontSize: 9, opacity: 0.5}}>{formatMeasurement(measurement.volume.cm3, "volume").main}</div>
                           </div>
                         </div>
                       </div>

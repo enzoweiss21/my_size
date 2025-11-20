@@ -1,17 +1,41 @@
 import React, { useRef, useEffect, useState } from "react";
-import { FilesetResolver, ImageSegmenter, PoseLandmarker } from "@mediapipe/tasks-vision";
+import ModeSelector from "./components/ModeSelector";
+import MeasurementDisplay from "./components/MeasurementDisplay";
+import { useCamera } from "./hooks/useCamera";
+import { useMediaPipe } from "./hooks/useMediaPipe";
+import { useDeviceOrientation } from "./hooks/useDeviceOrientation";
+import { formatMeasurement as formatMeasurementUtil } from "./utils/formatUtils";
+import { 
+  getNextFrontDot as getNextFrontDotUtil, 
+  getNextSideDot as getNextSideDotUtil, 
+  areAllFrontDotsPlaced as areAllFrontDotsPlacedUtil, 
+  areAllSideDotsPlaced as areAllSideDotsPlacedUtil, 
+  getDotColor as getDotColorUtil 
+} from "./utils/manualDrawingUtils";
+import { estimatePitchFromPose, estimateYawFromPose, estimateYawFromPoseStable, rad2deg, smoothAngle, deg2rad } from "./utils/angleUtils";
+import { correctForeshortening } from "./utils/foreshorteningUtils";
+import { refineEdgeY, coRegisterY, snapPairToY } from "./utils/calibrationUtils";
+import { circumferenceMm } from "./utils/circumferenceUtils";
+import { finalizeBand } from "./utils/measurementUtils";
+
+// Feature flags
+const FLAGS = {
+  sidePitchInScale: true, // if true, skip numeric pitch on side depths
+};
 
 export default function App() {
   // Mode selection: "select" = start page, "pose" = pose estimation flow, "manual" = manual drawing flow
   const [mode, setMode] = useState("select");
 
-  const videoRef = useRef(null);
+  // Custom hooks for camera, MediaPipe, and device orientation
+  const { videoRef, streamRef } = useCamera();
+  const { segRef, poseRef, isModelReady, isPoseReady } = useMediaPipe();
+  const { pitchDeg, rollDeg } = useDeviceOrientation();
+  
+  // Refs for UI elements
   const displayRef = useRef(null); // video or captured image
   const overlayRef = useRef(null);
-  const segRef = useRef(null);
-  const poseRef = useRef(null);
   const capturedCanvasRef = useRef(null); // offscreen canvas of captured photo
-  const streamRef = useRef(null); // store camera stream
 
   // user input + draggable lines
   const [heightCm, setHeightCm] = useState(173);
@@ -21,14 +45,6 @@ export default function App() {
 
   // computed scale
   const [scaleMmPerPx, setScaleMmPerPx] = useState(null);
-
-  // device orientation (keep phone level)
-  const [pitchDeg, setPitchDeg] = useState(0);
-  const [rollDeg, setRollDeg] = useState(0);
-
-  // segmentation model
-  const [isModelReady, setIsModelReady] = useState(false); // Track model readiness
-  const [isPoseReady, setIsPoseReady] = useState(false);
   // captured still photo for calibration
   const [capturedDataUrl, setCapturedDataUrl] = useState(null);
   // countdown before photo capture
@@ -88,78 +104,24 @@ export default function App() {
   const [sideHeelY, setSideHeelY] = useState(700);
   const [sideScaleMmPerPx, setSideScaleMmPerPx] = useState(null);
   const [sideDragging, setSideDragging] = useState(null); // "head" | "heel" | null
+  
+  // Pose data for tilt corrections
+  const [frontPose, setFrontPose] = useState(null); // MediaPipe pose landmarks from front photo
+  const [sidePose, setSidePose] = useState(null); // MediaPipe pose landmarks from side photo
+  const [frontPitch, setFrontPitch] = useState(0); // Pitch angle from front photo (radians)
+  const [sidePitch, setSidePitch] = useState(0); // Pitch angle from side photo (radians)
+  const [frontYaw, setFrontYaw] = useState(0); // Yaw angle from front photo (radians)
+  const [frontYawSmoothed, setFrontYawSmoothed] = useState(0); // Smoothed yaw for stability
+  const [frontTiltApplied, setFrontTiltApplied] = useState(false); // Whether pitch correction applied in lockScale
+  const [sideTiltApplied, setSideTiltApplied] = useState(false); // Whether pitch correction applied in lockScale
+  // Store pixel positions for co-registration
+  const [frontHeadYPx, setFrontHeadYPx] = useState(null); // Refined head Y in pixels
+  const [frontHeelYPx, setFrontHeelYPx] = useState(null); // Refined heel Y in pixels
+  const [sideHeadYPx, setSideHeadYPx] = useState(null); // Refined head Y in pixels
+  const [sideHeelYPx, setSideHeelYPx] = useState(null); // Refined heel Y in pixels
 
-  // ---- camera init ----
-  useEffect(() => {
-    (async () => {
-      try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
-        audio: false,
-      });
-        streamRef.current = stream; // Store stream for later use
-        if (videoRef.current) {
-      videoRef.current.srcObject = stream;
-      videoRef.current.onloadeddata = () => {
-        videoRef.current.play().catch((err) => console.error("Video play error:", err));
-      };
-        }
-      } catch (err) {
-        console.error("Camera error:", err);
-      }
-    })();
-    // Cleanup on unmount
-    return () => {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(track => track.stop());
-        streamRef.current = null;
-      }
-    };
-  }, []);
-
-  // ---- device orientation ----
-  useEffect(() => {
-    const h = (e) => { setPitchDeg(e.beta || 0); setRollDeg(e.gamma || 0); };
-    if (window.DeviceOrientationEvent) window.addEventListener("deviceorientation", h, true);
-    return () => window.removeEventListener("deviceorientation", h, true);
-  }, []);
-
-  // ---- load segmentation model ----
-  useEffect(() => {
-    (async () => {
-      try {
-        const fileset = await FilesetResolver.forVisionTasks(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
-        );
-        const segmenter = await ImageSegmenter.createFromOptions(fileset, {
-          baseOptions: {
-            // Use a hosted model URL since there's no local /public/models file
-            modelAssetPath:
-              "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite",
-          },
-          outputCategoryMask: true,
-          runningMode: "IMAGE",
-          categoryAllowlist: ["person"],
-        });
-        segRef.current = segmenter;
-        setIsModelReady(true); // Set model as ready
-        // Load pose landmarker
-        const pose = await PoseLandmarker.createFromOptions(fileset, {
-          baseOptions: {
-            modelAssetPath:
-              "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
-          },
-          runningMode: "IMAGE",
-          numPoses: 1,
-        });
-        poseRef.current = pose;
-        setIsPoseReady(true);
-      } catch (error) {
-        console.error("Failed to load segmentation model:", error);
-        alert("Failed to load segmentation model. Please check the model file.");
-      }
-    })();
-  }, []);
+  // Camera, MediaPipe, and device orientation are now handled by custom hooks above
+  // No initialization code needed here
 
   // ---- ensure canvas is available when switching to dot placement ----
   useEffect(() => {
@@ -206,21 +168,21 @@ export default function App() {
           if (activeTracks.length === 0) {
             console.log("Camera stream ended, reinitializing...");
             // Stream ended, need to reinitialize
-            (async () => {
+    (async () => {
               try {
-                const stream = await navigator.mediaDevices.getUserMedia({
-                  video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
-                  audio: false,
-                });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false,
+      });
                 streamRef.current = stream;
                 if (videoRef.current) {
-                  videoRef.current.srcObject = stream;
+      videoRef.current.srcObject = stream;
                   videoRef.current.play().catch(console.error);
                 }
               } catch (err) {
                 console.error("Failed to reinitialize camera:", err);
               }
-            })();
+    })();
             return;
           }
           
@@ -243,8 +205,8 @@ export default function App() {
         } else if (videoRef.current && !streamRef.current) {
           // Video element exists but no stream - try to get it
           console.log("Video element found but no stream, initializing camera...");
-          (async () => {
-            try {
+    (async () => {
+      try {
               const stream = await navigator.mediaDevices.getUserMedia({
                 video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
                 audio: false,
@@ -256,8 +218,8 @@ export default function App() {
               }
             } catch (err) {
               console.error("Failed to initialize camera:", err);
-            }
-          })();
+      }
+    })();
         }
       };
       
@@ -548,9 +510,10 @@ export default function App() {
         const moveX = (e.clientX - rect.left - offsetX) * scaleX;
         const moveY = (e.clientY - rect.top - offsetY) * scaleY;
         
-        // Clamp to image bounds
-        const clampedX = Math.max(0, Math.min(imageWidth, moveX));
-        const clampedY = Math.max(0, Math.min(imageHeight, moveY));
+        // Gotcha guard: Disallow dots within 2px of image borders
+        const MIN_EDGE_DISTANCE = 2;
+        const clampedX = Math.max(MIN_EDGE_DISTANCE, Math.min(imageWidth - MIN_EDGE_DISTANCE, moveX));
+        const clampedY = Math.max(MIN_EDGE_DISTANCE, Math.min(imageHeight - MIN_EDGE_DISTANCE, moveY));
         
         // Handle special case of "knee-center" where we need to handle it differently
         let type, side;
@@ -622,10 +585,11 @@ export default function App() {
   // - User's known height (heightCm)
   // - Measured pixel distance between head and heel (spanPx) in ACTUAL image pixels
   // - Sub-pixel edge refinement for accuracy
+  // - Pose-tilt correction (cos(pitch) factor)
   // - Pitch/lens guardrails for quality
-  // Formula: scaleMmPerPx = (heightCm * 10) / spanPx
-  const lockScale = () => {
-    const processScale = (canvas, headYLogical, heelYLogical, isManual = false, photoType = null) => {
+  // Formula: scaleMmPerPx = (heightCm * 10 * cos(pitchRad)) / spanPx
+  const lockScale = async () => {
+    const processScale = (canvas, headYLogical, heelYLogical, isManual = false, photoType = null, pitchRadOverride = null) => {
       if (!canvas) {
         return { error: isManual ? `No ${photoType} image captured. Please capture a photo first.` : "No image captured. Please capture a photo first." };
       }
@@ -662,13 +626,31 @@ export default function App() {
         return { error: "Hold phone level (|pitch|,|roll| < 2°)." };
       }
       
+      // Gotcha guard: Crop check - if top of head is cropped, block calibration
+      // Check if head Y is too close to top (within 5% of image height)
+      if (headYPx < actualImageHeight * 0.05) {
+        return { error: "Top of head appears cropped. Please ensure full body is visible in frame." };
+      }
+      
+      // Gotcha guard: Footwear hint - if heel line is on shoe, warn user
+      // (This is a soft hint, not a blocker - we'll allow ±1% manual nudge in dev mode later)
+      if (heelYPx > actualImageHeight * 0.95) {
+        console.warn("[calibration] Heel line near bottom - if on footwear, measurements may be slightly off. Line to bare heel if possible.");
+      }
+      
       // Pitch/lens guardrails: reject if span ratio is suspicious
       const spanRatio = spanPx / actualImageHeight;
       if (spanRatio < 0.35 || spanRatio > 0.95) {
         return { error: `Bad calibration: body span (${spanRatio.toFixed(2)} of image height) suggests crop/tilt. Please retake photo.` };
       }
       
-      const computedScale = (heightCm * 10) / spanPx;
+      // POSE-TILT CORRECTION: Use provided pitchRad or default to 0
+      const pitchRad = pitchRadOverride ?? 0;
+      
+      // Apply pose-tilt correction: mmPerPx = (heightCm * 10 * cos(pitchRad)) / spanPx
+      // If no pose data, pitchRad = 0, so cos(0) = 1 (no correction)
+      const cosPitch = Math.cos(Math.abs(pitchRad));
+      const computedScale = (heightCm * 10 * cosPitch) / spanPx;
       
       return {
         scale: computedScale,
@@ -676,50 +658,120 @@ export default function App() {
         headYPx,
         heelYPx,
         imageWidth: actualImageWidth,
-        imageHeight: actualImageHeight
+        imageHeight: actualImageHeight,
+        pitchRad
       };
+    };
+    
+    // Helper to detect pose and estimate pitch (and yaw for front photos)
+    const detectPoseAndEstimatePitch = async (canvas, photoType = null) => {
+      if (!isPoseReady || !poseRef.current || !canvas) return { pitchRad: 0, yawRad: 0, poseResult: null };
+      
+      try {
+        const poseResult = await poseRef.current.detect(canvas);
+        if (poseResult && poseResult.landmarks && poseResult.landmarks.length > 0) {
+          // Store pose data
+          if (mode === "manual") {
+            if (photoType === "front") {
+              setFrontPose(poseResult);
+            } else if (photoType === "side") {
+              setSidePose(poseResult);
+            }
+          }
+          
+          const pitchRad = estimatePitchFromPose(poseResult);
+          let yawRad = 0;
+          
+          // Estimate yaw for front photos (for foreshortening correction)
+          if (photoType === "front") {
+            yawRad = estimateYawFromPose(poseResult);
+            setFrontYaw(yawRad);
+            console.log(`[${photoType}] Detected pose, estimated pitch: ${rad2deg(pitchRad).toFixed(1)}°, yaw: ${rad2deg(yawRad).toFixed(1)}°`);
+          } else {
+            console.log(`[${photoType || "pose"}] Detected pose, estimated pitch: ${rad2deg(pitchRad).toFixed(1)}°`);
+          }
+          
+          return { pitchRad, yawRad, poseResult };
+        }
+      } catch (e) {
+        console.warn("Pose detection failed:", e);
+      }
+      return { pitchRad: 0, yawRad: 0, poseResult: null };
     };
     
     // Handle manual mode - separate calibration for front and side
     if (mode === "manual") {
       if (manualCaptureState === "front-calibration") {
         const canvas = capturedCanvasRef.current;
-        const result = processScale(canvas, frontHeadY, frontHeelY, true, "front");
+        // Detect pose and estimate pitch/yaw for corrections
+        const { pitchRad, yawRad, poseResult } = await detectPoseAndEstimatePitch(canvas, "front");
+        setFrontPitch(pitchRad);
+          // Use smoother yaw estimate with angle sanity bounds
+          const rawYaw = estimateYawFromPose(poseResult);
+          const smoothedYaw = smoothAngle(frontYawSmoothed, rawYaw, 0.6, deg2rad(20));
+          setFrontYaw(smoothedYaw);
+          setFrontYawSmoothed(smoothedYaw);
+        
+        const result = processScale(canvas, frontHeadY, frontHeelY, true, "front", pitchRad);
         if (result.error) {
           return alert(result.error);
         }
         setFrontScaleMmPerPx(result.scale);
-        console.log(`Front pixel calibration locked: ${result.scale.toFixed(3)} mm/px`);
+        setFrontTiltApplied(true); // Mark that pitch correction was applied in lockScale
+        setFrontHeadYPx(result.headYPx); // Store pixel positions for co-registration
+        setFrontHeelYPx(result.heelYPx);
+        
+        // Log both raw and tilt-corrected scales for debugging
+        const rawScale = (heightCm * 10) / result.spanPx;
+        const tiltFactor = Math.cos(Math.abs(pitchRad));
+        console.log(`[scale] front span=${result.spanPx.toFixed(0)}px raw=${rawScale.toFixed(3)} mm/px tilt=${tiltFactor.toFixed(3)} -> mm/px=${result.scale.toFixed(3)}`);
+        console.log(`Front pixel calibration locked: ${result.scale.toFixed(3)} mm/px (tilt-applied)`);
         console.log(`  Image: ${result.imageWidth}×${result.imageHeight}px`);
         console.log(`  Head Y: ${result.headYPx.toFixed(1)}px, Heel Y: ${result.heelYPx.toFixed(1)}px`);
         console.log(`  Span: ${result.spanPx.toFixed(1)}px, Height: ${heightCm}cm (${heightCm * 10}mm)`);
+        console.log(`  Pitch: ${rad2deg(pitchRad).toFixed(1)}°, Yaw (smoothed): ${rad2deg(smoothedYaw).toFixed(1)}°`);
         return;
       } else if (manualCaptureState === "side-calibration") {
         const canvas = capturedCanvasRef.current;
-        const result = processScale(canvas, sideHeadY, sideHeelY, true, "side");
+        // Detect pose and estimate pitch for pose-tilt correction
+        const { pitchRad } = await detectPoseAndEstimatePitch(canvas, "side");
+        setSidePitch(pitchRad);
+        
+        const result = processScale(canvas, sideHeadY, sideHeelY, true, "side", pitchRad);
         if (result.error) {
           return alert(result.error);
         }
         setSideScaleMmPerPx(result.scale);
-        console.log(`Side pixel calibration locked: ${result.scale.toFixed(3)} mm/px`);
+        setSideTiltApplied(true); // Mark that pitch correction was applied in lockScale
+        setSideHeadYPx(result.headYPx); // Store pixel positions for co-registration
+        setSideHeelYPx(result.heelYPx);
+        
+        // Log both raw and tilt-corrected scales for debugging
+        const rawScale = (heightCm * 10) / result.spanPx;
+        const tiltFactor = Math.cos(Math.abs(pitchRad));
+        console.log(`[scale] side span=${result.spanPx.toFixed(0)}px raw=${rawScale.toFixed(3)} mm/px tilt=${tiltFactor.toFixed(3)} -> mm/px=${result.scale.toFixed(3)}`);
+        console.log(`Side pixel calibration locked: ${result.scale.toFixed(3)} mm/px (tilt-applied)`);
         console.log(`  Image: ${result.imageWidth}×${result.imageHeight}px`);
         console.log(`  Head Y: ${result.headYPx.toFixed(1)}px, Heel Y: ${result.heelYPx.toFixed(1)}px`);
         console.log(`  Span: ${result.spanPx.toFixed(1)}px, Height: ${heightCm}cm (${heightCm * 10}mm)`);
+        console.log(`  Pitch: ${rad2deg(pitchRad).toFixed(1)}°`);
         return;
       }
     }
     
     // Pose estimation mode
     const canvas = capturedCanvasRef.current;
-    const result = processScale(canvas, headY, heelY);
+    const { pitchRad } = await detectPoseAndEstimatePitch(canvas);
+    const result = processScale(canvas, headY, heelY, false, null, pitchRad);
     if (result.error) {
       return alert(result.error);
     }
     setScaleMmPerPx(result.scale);
-    console.log(`Pixel calibration locked: ${result.scale.toFixed(3)} mm/px`);
+    console.log(`Pixel calibration locked: ${result.scale.toFixed(3)} mm/px (pitch-corrected)`);
     console.log(`  Image dimensions: ${result.imageWidth}×${result.imageHeight}px`);
     console.log(`  Head Y: ${result.headYPx.toFixed(1)}px, Heel Y: ${result.heelYPx.toFixed(1)}px`);
     console.log(`  Span: ${result.spanPx.toFixed(1)}px, Height: ${heightCm}cm (${heightCm * 10}mm)`);
+    console.log(`  Pitch: ${rad2deg(pitchRad).toFixed(1)}°, cos factor: ${Math.cos(Math.abs(pitchRad)).toFixed(3)}`);
   };
 
   // ---- capture photo helper ----
@@ -1047,13 +1099,73 @@ export default function App() {
       return;
     }
 
+    // STEP: Apply foreshortening corrections (NUMERIC PITCH/YAW CORRECTION)
+    // Convert measurements to raw format for correction
+    const rawMeasurements = {
+      frontWidthsMm: {},
+      sideDepthsMm: {}
+    };
+    
     const landmarks = ["chest", "waist", "hips", "thighs"];
+    landmarks.forEach(landmark => {
+      if (widths[landmark]) {
+        rawMeasurements.frontWidthsMm[landmark] = widths[landmark].mm;
+      }
+      if (depths[landmark]) {
+        rawMeasurements.sideDepthsMm[landmark] = depths[landmark].mm;
+      }
+    });
+    
+    // Estimate angles if not already stored
+    let yawFrontRad = frontYaw;
+    if (!yawFrontRad && frontPose) {
+      yawFrontRad = estimateYawFromPose(frontPose);
+      setFrontYaw(yawFrontRad);
+    }
+    
+    const pitchSideRad = sidePitch;
+    
+    console.log(`[Foreshortening] Front yaw: ${rad2deg(yawFrontRad).toFixed(1)}°, Side pitch: ${rad2deg(pitchSideRad).toFixed(1)}°`);
+    
+    // Apply corrections
+    const correctedMeasurements = correctForeshortening(rawMeasurements, yawFrontRad, pitchSideRad);
+    
+    // Update widths and depths with corrected values
+    const correctedWidths = { ...widths };
+    const correctedDepths = { ...depths };
+    
+    Object.keys(correctedMeasurements.frontWidthsMm).forEach(landmark => {
+      if (correctedWidths[landmark]) {
+        const correctedMm = correctedMeasurements.frontWidthsMm[landmark];
+        const correctedCm = correctedMm / 10;
+        correctedWidths[landmark] = {
+          ...correctedWidths[landmark],
+          mm: correctedMm,
+          cm: correctedCm
+        };
+        console.log(`[${landmark}] Width corrected: ${correctedCm.toFixed(1)}cm (was ${(rawMeasurements.frontWidthsMm[landmark] / 10).toFixed(1)}cm)`);
+      }
+    });
+    
+    Object.keys(correctedMeasurements.sideDepthsMm).forEach(landmark => {
+      if (correctedDepths[landmark]) {
+        const correctedMm = correctedMeasurements.sideDepthsMm[landmark];
+        const correctedCm = correctedMm / 10;
+        correctedDepths[landmark] = {
+          ...correctedDepths[landmark],
+          mm: correctedMm,
+          cm: correctedCm
+        };
+        console.log(`[${landmark}] Depth corrected: ${correctedCm.toFixed(1)}cm (was ${(rawMeasurements.sideDepthsMm[landmark] / 10).toFixed(1)}cm)`);
+      }
+    });
+
     const combinedMeasurements = {};
 
-    // For each landmark, combine width (front) and depth (side) for 3D calculations
+    // For each landmark, combine width (front) and depth (side) for 3D calculations (using corrected values)
     landmarks.forEach(landmark => {
-      const width = widths[landmark];
-      const depth = depths[landmark];
+      const width = correctedWidths[landmark];
+      const depth = correctedDepths[landmark];
 
       if (width && depth) {
         // QA: Soft coupling - width should not exceed depth by too much (catches arm leaks)
@@ -1869,114 +1981,29 @@ export default function App() {
     event.target.value = '';
   };
 
-  // Helper: Get next dot to place for front photo
+  // Helper: Get next dot to place for front photo (using imported utility)
   const getNextFrontDot = () => {
-    // Standard width measurements (left/right)
-    const widthOrder = ['shoulders', 'chest', 'waist', 'hips'];
-    for (const type of widthOrder) {
-      if (!manualDots.front[type].left) {
-        return { type, side: 'left' };
-      }
-      if (!manualDots.front[type].right) {
-        return { type, side: 'right' };
-      }
-    }
-    
-    // Thigh measurements: thickness (left/right) then length (top)
-    if (!manualDots.front.thighs.left) {
-      return { type: 'thighs', side: 'left' };
-    }
-    if (!manualDots.front.thighs.right) {
-      return { type: 'thighs', side: 'right' };
-    }
-    if (!manualDots.front.thighs.top) {
-      return { type: 'thighs', side: 'top' };
-    }
-    
-    // Knee center point (midpoint for leg length)
-    if (!manualDots.front.knee.center) {
-      return { type: 'knee', side: 'center' };
-    }
-    
-    // Calf measurements: thickness (left/right) then length (bottom)
-    if (!manualDots.front.calves.left) {
-      return { type: 'calves', side: 'left' };
-    }
-    if (!manualDots.front.calves.right) {
-      return { type: 'calves', side: 'right' };
-    }
-    if (!manualDots.front.calves.bottom) {
-      return { type: 'calves', side: 'bottom' };
-    }
-    
-    return null; // All dots placed
+    return getNextFrontDotUtil(manualDots);
   };
 
-  // Helper: Get next dot to place for side photo
+  // Helper: Get next dot to place for side photo (using imported utility)
   const getNextSideDot = () => {
-    const order = ['chest', 'waist', 'hips', 'thighs', 'calves'];
-    for (const type of order) {
-      if (!manualDots.side[type].front) {
-        return { type, side: 'front' };
-      }
-      if (!manualDots.side[type].back) {
-        return { type, side: 'back' };
-      }
-    }
-    return null; // All dots placed
+    return getNextSideDotUtil(manualDots);
   };
 
-  // Helper: Check if all front dots are placed
+  // Helper: Check if all front dots are placed (using imported utility)
   const areAllFrontDotsPlaced = () => {
-    // Standard width measurements
-    const widthComplete = ['shoulders', 'chest', 'waist', 'hips'].every(type => 
-      manualDots.front[type].left && manualDots.front[type].right
-    );
-    
-    // Thigh measurements: left, right, and top
-    const thighsComplete = manualDots.front.thighs.left && 
-                          manualDots.front.thighs.right && 
-                          manualDots.front.thighs.top;
-    
-    // Knee center
-    const kneeComplete = manualDots.front.knee.center !== null;
-    
-    // Calf measurements: left, right, and bottom
-    const calvesComplete = manualDots.front.calves.left && 
-                          manualDots.front.calves.right && 
-                          manualDots.front.calves.bottom;
-    
-    return widthComplete && thighsComplete && kneeComplete && calvesComplete;
+    return areAllFrontDotsPlacedUtil(manualDots);
   };
-
-  // Helper: Check if all side dots are placed
+  
+  // Helper: Check if all side dots are placed (using imported utility)
   const areAllSideDotsPlaced = () => {
-    return ['chest', 'waist', 'hips', 'thighs', 'calves'].every(type => 
-      manualDots.side[type].front && manualDots.side[type].back
-    );
+    return areAllSideDotsPlacedUtil(manualDots);
   };
 
-  // Helper: Get dot color based on type and photo type
+  // Helper: Get dot color based on type and photo type (using imported utility)
   const getDotColor = (photoType, type, side) => {
-    const colors = {
-      front: {
-        shoulders: { left: '#ff6b6b', right: '#ee5a6f' },
-        chest: { left: '#4ecdc4', right: '#44a08d' },
-        waist: { left: '#3b82f6', right: '#ef4444' },
-        hips: { left: '#9b59b6', right: '#8e44ad' },
-        thighs: { left: '#f39c12', right: '#e67e22', top: '#f39c12' }, // Thickness (left/right) and length (top)
-        knee: { center: '#e74c3c' }, // Knee center point
-        calves: { left: '#1abc9c', right: '#16a085', bottom: '#1abc9c' } // Thickness (left/right) and length (bottom)
-      },
-      side: {
-        chest: { front: '#f59e0b', back: '#d97706' },
-        waist: { front: '#f59e0b', back: '#8b5cf6' },
-        hips: { front: '#10b981', back: '#059669' },
-        thighs: { front: '#f39c12', back: '#e67e22' }, // Thigh depth/thickness
-        calves: { front: '#1abc9c', back: '#16a085' }  // Calf depth/thickness
-      }
-    };
-    return colors[photoType]?.[type]?.[side] || '#60a5fa';
+    return getDotColorUtil(photoType, type, side);
   };
 
   // Manual drawing: handle clicking on image to place dots (if not dragging)
@@ -2022,9 +2049,17 @@ export default function App() {
     const clickX = (e.clientX - rect.left - offsetX) * scaleX;
     const clickY = (e.clientY - rect.top - offsetY) * scaleY;
     
-    // Clamp to image bounds
-    const clampedX = Math.max(0, Math.min(imageWidth, clickX));
-    const clampedY = Math.max(0, Math.min(imageHeight, clickY));
+    // Gotcha guard: Disallow dots within 2px of image borders
+    const MIN_EDGE_DISTANCE = 2;
+    if (clickX < MIN_EDGE_DISTANCE || clickX > imageWidth - MIN_EDGE_DISTANCE ||
+        clickY < MIN_EDGE_DISTANCE || clickY > imageHeight - MIN_EDGE_DISTANCE) {
+      alert(`Please place dots at least ${MIN_EDGE_DISTANCE}px away from image edges for accurate measurements.`);
+      return;
+    }
+    
+    // Clamp to image bounds (with edge guard)
+    const clampedX = Math.max(MIN_EDGE_DISTANCE, Math.min(imageWidth - MIN_EDGE_DISTANCE, clickX));
+    const clampedY = Math.max(MIN_EDGE_DISTANCE, Math.min(imageHeight - MIN_EDGE_DISTANCE, clickY));
     
     console.log(`Click on ${photoType} photo:`, { clickX, clickY, clampedX, clampedY });
     
@@ -2081,6 +2116,105 @@ export default function App() {
   // Helper: Convert cm to inches (1 cm = 0.393701 inches)
   const cmToInches = (cm) => {
     return Math.round((cm * 0.393701) * 10) / 10;
+  };
+  
+  // ===== ANGLE HELPERS =====
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+  const deg2rad = (d) => d * Math.PI / 180;
+  const rad2deg = (r) => r * 180 / Math.PI;
+  
+  // Estimate pitch from pose landmarks (lean forward/back)
+  // Uses shoulder->hip vertical slope
+  const estimatePitchFromPose = (pose) => {
+    if (!pose || !pose.landmarks || pose.landmarks.length < 33) return 0;
+    
+    const lm = pose.landmarks; // MediaPipe 33 landmarks (normalized [0..1])
+    
+    // Use average left/right shoulder and hip
+    // MediaPipe indices: 11=left_shoulder, 12=right_shoulder, 23=left_hip, 24=right_hip
+    const shY = (lm[11]?.y + lm[12]?.y) * 0.5; // shoulders
+    const hpY = (lm[23]?.y + lm[24]?.y) * 0.5; // hips
+    
+    if (!shY || !hpY) return 0;
+    
+    // Crude pitch proxy: vertical delta mapped to angle
+    const dy = (hpY - shY); // screen space (normalized)
+    const dx = 0.30; // nominal torso width in normalized units
+    let pitch = Math.atan2(dy, dx); // radians
+    
+    pitch = clamp(pitch, -deg2rad(25), deg2rad(25));
+    return pitch;
+  };
+  
+  // Estimate yaw from front image pose (rotation around vertical axis)
+  // Compares shoulder x to hip x (horizontal offset)
+  const estimateYawFromPose = (pose) => {
+    if (!pose || !pose.landmarks || pose.landmarks.length < 33) return 0;
+    
+    const lm = pose.landmarks;
+    const shX = (lm[11]?.x + lm[12]?.x) * 0.5;
+    const hpX = (lm[23]?.x + lm[24]?.x) * 0.5;
+    
+    if (!shX || !hpX) return 0;
+    
+    // Horizontal displacement relative to nominal torso height
+    const shY = (lm[11]?.y + lm[12]?.y) * 0.5;
+    const hpY = (lm[23]?.y + lm[24]?.y) * 0.5;
+    const torsoH = Math.abs(shY - hpY) + 1e-6;
+    
+    let yaw = Math.atan2(hpX - shX, torsoH); // radians
+    yaw = clamp(yaw, -deg2rad(30), deg2rad(30));
+    return yaw;
+  };
+  
+  // Apply foreshortening corrections with soft caps
+  const correctForeshortening = (meas, yawFrontRad, pitchSideRad) => {
+    const cosy = Math.max(Math.cos(Math.abs(yawFrontRad || 0)), 0.87); // cap to avoid division by tiny values
+    const cosp = Math.max(Math.cos(Math.abs(pitchSideRad || 0)), 0.87);
+    const cap = 1.15; // max +15% correction
+    
+    const corrected = {
+      frontWidthsMm: meas.frontWidthsMm ? { ...meas.frontWidthsMm } : {},
+      sideDepthsMm: meas.sideDepthsMm ? { ...meas.sideDepthsMm } : {}
+    };
+    
+    // Correct front widths for yaw
+    if (corrected.frontWidthsMm) {
+      for (const k of ["shoulders", "chest", "waist", "hips", "thighs", "calves"]) {
+        if (corrected.frontWidthsMm[k] != null && typeof corrected.frontWidthsMm[k] === 'number') {
+          const wRaw = corrected.frontWidthsMm[k];
+          if (isFinite(wRaw) && wRaw > 0) {
+            const wCorr = wRaw / cosy;
+            corrected.frontWidthsMm[k] = Math.min(wCorr, wRaw * cap);
+            // Validate result
+            if (!isFinite(corrected.frontWidthsMm[k]) || corrected.frontWidthsMm[k] <= 0) {
+              console.warn(`[${k}] Invalid corrected width, using raw value:`, wRaw);
+              corrected.frontWidthsMm[k] = wRaw;
+            }
+          }
+        }
+      }
+    }
+    
+    // Correct side depths for pitch
+    if (corrected.sideDepthsMm) {
+      for (const k of ["chest", "waist", "hips", "thighs", "calves"]) {
+        if (corrected.sideDepthsMm[k] != null && typeof corrected.sideDepthsMm[k] === 'number') {
+          const dRaw = corrected.sideDepthsMm[k];
+          if (isFinite(dRaw) && dRaw > 0) {
+            const dCorr = dRaw / cosp;
+            corrected.sideDepthsMm[k] = Math.min(dCorr, dRaw * cap);
+            // Validate result
+            if (!isFinite(corrected.sideDepthsMm[k]) || corrected.sideDepthsMm[k] <= 0) {
+              console.warn(`[${k}] Invalid corrected depth, using raw value:`, dRaw);
+              corrected.sideDepthsMm[k] = dRaw;
+            }
+          }
+        }
+      }
+    }
+    
+    return corrected;
   };
   
   // ===== PIXEL SCALE REFINEMENT =====
@@ -2182,24 +2316,51 @@ export default function App() {
   
   // Auto-chooser for circumference model
   const circumferenceMm = (widthMm, depthMm, curvatureHint = 0.5) => {
-    if (!widthMm || !depthMm) return 0;
+    // Validate inputs
+    if (!widthMm || !depthMm || !isFinite(widthMm) || !isFinite(depthMm)) {
+      console.warn("circumferenceMm: Invalid inputs", { widthMm, depthMm });
+      return 0;
+    }
+    if (widthMm <= 0 || depthMm <= 0) {
+      console.warn("circumferenceMm: Non-positive inputs", { widthMm, depthMm });
+      return 0;
+    }
     
     const aspectRatio = Math.max(widthMm, depthMm) / Math.min(widthMm, depthMm);
+    
+    if (!isFinite(aspectRatio) || aspectRatio <= 0) {
+      console.warn("circumferenceMm: Invalid aspect ratio", { widthMm, depthMm, aspectRatio });
+      return 0;
+    }
+    
+    let result = 0;
     
     // Boxy silhouette -> rounded rectangle
     if (curvatureHint > 0.6) {
       const r = 0.12 * Math.min(widthMm, depthMm);
-      return roundedRectPerimeter(widthMm, depthMm, r);
+      result = roundedRectPerimeter(widthMm, depthMm, r);
     }
-    
     // Near-circle -> Ramanujan
-    if (aspectRatio < 1.15) {
-      return ramanujanEllipsePerimeter(widthMm, depthMm);
+    else if (aspectRatio < 1.15) {
+      result = ramanujanEllipsePerimeter(widthMm, depthMm);
+    }
+    // General case -> superellipse
+    else {
+      const n = aspectRatio > 1.3 ? 4.0 : 3.2;
+      result = superellipsePerimeter(widthMm / 2, depthMm / 2, n);
     }
     
-    // General case -> superellipse
-    const n = aspectRatio > 1.3 ? 4.0 : 3.2;
-    return superellipsePerimeter(widthMm / 2, depthMm / 2, n);
+    // Validate result
+    if (!isFinite(result) || result <= 0) {
+      console.warn("circumferenceMm: Invalid result, using Ramanujan fallback", { widthMm, depthMm, result });
+      result = ramanujanEllipsePerimeter(widthMm, depthMm);
+      if (!isFinite(result) || result <= 0) {
+        console.error("circumferenceMm: All methods failed", { widthMm, depthMm });
+        return 0;
+      }
+    }
+    
+    return result;
   };
   
   // ===== CO-REGISTRATION HELPERS =====
@@ -2293,7 +2454,20 @@ export default function App() {
       const aspectRatio = Math.max(widthMm, depthMm) / Math.min(widthMm, depthMm);
       const curvatureHint = aspectRatio > 1.3 ? 0.7 : 0.4; // Higher aspect = boxier
       
+      // Validate inputs before calculating circumference
+      if (!isFinite(widthMm) || !isFinite(depthMm) || widthMm <= 0 || depthMm <= 0) {
+        console.warn(`[${name}] Invalid width/depth for circumference: width=${widthMm}, depth=${depthMm}`);
+        return; // Skip this landmark
+      }
+      
       const circumferenceMmValue = circumferenceMm(widthMm, depthMm, curvatureHint);
+      
+      // Validate circumference result
+      if (!isFinite(circumferenceMmValue) || circumferenceMmValue <= 0) {
+        console.warn(`[${name}] Invalid circumference result: ${circumferenceMmValue}, skipping`);
+        return; // Skip this landmark
+      }
+      
       const circumferenceCm = circumferenceMmValue / 10;
       
       // Human plausibility check
@@ -2301,14 +2475,20 @@ export default function App() {
         console.warn(`${name}: Circumference ${circumferenceCm.toFixed(1)}cm outside typical range (90-140cm). Consider re-taking side photo or adjusting calibration lines.`);
       }
       
-      return {
-        name: name,
-        width: width,
-        depth: depth,
-        circumference: {
-          cm: Math.round(circumferenceCm * 10) / 10,
-          mm: Math.round(circumferenceMmValue)
-        },
+        // Final validation before returning
+        if (!isFinite(circumferenceCm) || circumferenceCm <= 0 || !isFinite(circumferenceMmValue) || circumferenceMmValue <= 0) {
+          console.error(`[${name}] Invalid circumference values: cm=${circumferenceCm}, mm=${circumferenceMmValue}`);
+          return null; // Skip invalid measurements
+        }
+        
+        return {
+          name: name,
+          width: width,
+          depth: depth,
+          circumference: {
+            cm: Math.round(circumferenceCm * 10) / 10,
+            mm: Math.round(circumferenceMmValue)
+          },
         crossSectionalArea: {
           cm2: Math.round(crossSectionalAreaCm2 * 10) / 10,
           mm2: Math.round(crossSectionalAreaMm2)
@@ -2316,7 +2496,13 @@ export default function App() {
       };
     };
 
-    // Calculate all front measurements (widths)
+    // Step 1: Calculate raw measurements from dots (before foreshortening correction)
+    const rawMeasurements = {
+      frontWidthsMm: {},
+      sideDepthsMm: {}
+    };
+    
+    // Calculate all front measurements (widths) - RAW
     const frontTypes = ['shoulders', 'chest', 'waist', 'hips'];
     frontTypes.forEach(type => {
       const leftDot = manualDots.front[type].left;
@@ -2325,20 +2511,22 @@ export default function App() {
       const width = calculateDistance(leftDot, rightDot, frontScaleMmPerPx);
       if (width) {
         measurements[`${type}Width`] = width;
-        console.log(`[${type} width] Calculated:`, width);
+        rawMeasurements.frontWidthsMm[type] = width.mm; // Store raw mm for correction
+        console.log(`[${type} width] Calculated (raw):`, width);
       } else {
         console.log(`[${type} width] Failed to calculate - missing dots`);
       }
     });
 
-    // Calculate thigh and calf widths (thickness from front photo)
+    // Calculate thigh and calf widths (thickness from front photo) - RAW
     const thighsLeft = manualDots.front.thighs.left;
     const thighsRight = manualDots.front.thighs.right;
     console.log(`[thighs width] Left dot:`, thighsLeft, "Right dot:", thighsRight);
     const thighsWidth = calculateDistance(thighsLeft, thighsRight, frontScaleMmPerPx);
     if (thighsWidth) {
       measurements.thighsWidth = thighsWidth;
-      console.log(`[thighs width] Calculated:`, thighsWidth);
+      rawMeasurements.frontWidthsMm.thighs = thighsWidth.mm;
+      console.log(`[thighs width] Calculated (raw):`, thighsWidth);
     } else {
       console.log(`[thighs width] Failed to calculate - missing dots`);
     }
@@ -2349,44 +2537,209 @@ export default function App() {
     const calvesWidth = calculateDistance(calvesLeft, calvesRight, frontScaleMmPerPx);
     if (calvesWidth) {
       measurements.calvesWidth = calvesWidth;
-      console.log(`[calves width] Calculated:`, calvesWidth);
+      rawMeasurements.frontWidthsMm.calves = calvesWidth.mm;
+      console.log(`[calves width] Calculated (raw):`, calvesWidth);
     } else {
       console.log(`[calves width] Failed to calculate - missing dots`);
     }
 
-    // Calculate all side measurements (depths)
+    // Calculate all side measurements (depths) - RAW (with co-registration)
     const sideTypes = ['chest', 'waist', 'hips', 'thighs', 'calves'];
     sideTypes.forEach(type => {
       const frontDot = manualDots.side[type].front;
       const backDot = manualDots.side[type].back;
       console.log(`[${type} depth] Front dot:`, frontDot, "Back dot:", backDot);
+      
+      // Co-registration: find corresponding front width Y position
+      let yFrontCenter = null;
+      if (type !== 'thighs' && type !== 'calves') {
+        // For standard measurements, get Y from front width dots
+        const leftDot = manualDots.front[type].left;
+        const rightDot = manualDots.front[type].right;
+        if (leftDot && rightDot) {
+          yFrontCenter = (leftDot.y + rightDot.y) / 2;
+        }
+      }
+      
+      // Hard co-registration: snap side pair to registered Y before computing depth
+      let coRegDeltaY = 0;
+      if (yFrontCenter && frontHeadYPx && frontHeelYPx && sideHeadYPx && sideHeelYPx) {
+        const ySideRegistered = coRegisterY(yFrontCenter, frontHeadYPx, frontHeelYPx, sideHeadYPx, sideHeelYPx);
+        const ySideActual = frontDot && backDot ? (frontDot.y + backDot.y) / 2 : null;
+        if (ySideActual) {
+          coRegDeltaY = Math.abs(ySideRegistered - ySideActual);
+          if (coRegDeltaY > 10) {
+            console.log(`[${type} depth] Co-registering: actual Y=${ySideActual.toFixed(1)}, registered Y=${ySideRegistered.toFixed(1)}, adjusting by ${(ySideRegistered - ySideActual).toFixed(1)}px`);
+            // Hard snap: use snapPairToY to ensure both dots are at registered Y
+            [frontDot, backDot] = snapPairToY(frontDot, backDot, ySideRegistered);
+          }
+        }
+      }
+      
       const depth = calculateDistance(frontDot, backDot, sideScaleMmPerPx);
       if (depth) {
         measurements[`${type}Depth`] = depth;
-        console.log(`[${type} depth] Calculated:`, depth);
+        rawMeasurements.sideDepthsMm[type] = depth.mm; // Store raw mm for correction
+        console.log(`[${type} depth] Calculated (raw):`, depth);
       } else {
         console.log(`[${type} depth] Failed to calculate - missing dots`);
       }
     });
 
-    // Calculate 3D measurements for all available pairs
+    // Step 2: Apply foreshortening corrections (NUMERIC PITCH/YAW CORRECTION)
+    // Use smoothed yaw from front pose (already calculated during lockScale)
+    let yawFrontRad = frontYawSmoothed;
+    if (!yawFrontRad && frontPose) {
+      // Re-estimate if not already smoothed (fallback)
+      yawFrontRad = estimateYawFromPoseStable(frontPose, frontYawSmoothed);
+      setFrontYaw(yawFrontRad);
+      setFrontYawSmoothed(yawFrontRad);
+    }
+    
+    // Use stored side pitch with smoothing (already estimated during lockScale, but smooth it)
+    const pitchSideRadRaw = sidePitch;
+    // Smooth side pitch with angle sanity bounds
+    const pitchSideRad = smoothAngle(sidePitch, pitchSideRadRaw, 0.6, deg2rad(20));
+    
+    // Use feature flag to control side pitch correction
+    const effectiveSideTiltApplied = FLAGS.sidePitchInScale ? sideTiltApplied : false;
+    
+    console.log(`[Foreshortening] Front yaw (smoothed): ${rad2deg(yawFrontRad).toFixed(1)}°, Side pitch (smoothed): ${rad2deg(pitchSideRad).toFixed(1)}°`);
+    console.log(`[Foreshortening] Front tilt applied: ${frontTiltApplied}, Side tilt applied: ${effectiveSideTiltApplied} (flag: ${FLAGS.sidePitchInScale})`);
+    
+    // Apply corrections (skip pitch correction for side if flag says it was already applied in lockScale)
+    const correctedMeasurements = correctForeshortening(rawMeasurements, yawFrontRad, pitchSideRad, effectiveSideTiltApplied);
+    
+    // Update measurements with corrected values (with validation)
+    Object.keys(correctedMeasurements.frontWidthsMm).forEach(type => {
+      const correctedMm = correctedMeasurements.frontWidthsMm[type];
+      
+      // Validate corrected value
+      if (!isFinite(correctedMm) || correctedMm <= 0) {
+        console.warn(`[${type} width] Invalid corrected value: ${correctedMm}, using raw value`);
+        const rawMm = rawMeasurements.frontWidthsMm[type];
+        if (isFinite(rawMm) && rawMm > 0) {
+          correctedMm = rawMm; // Fallback to raw value
+        } else {
+          console.error(`[${type} width] Raw value also invalid: ${rawMm}, skipping`);
+          return; // Skip this measurement
+        }
+      }
+      
+      const correctedCm = correctedMm / 10;
+      if (type === 'thighs') {
+        measurements.thighsWidth = {
+          ...measurements.thighsWidth,
+          mm: correctedMm,
+          cm: correctedCm
+        };
+      } else if (type === 'calves') {
+        measurements.calvesWidth = {
+          ...measurements.calvesWidth,
+          mm: correctedMm,
+          cm: correctedCm
+        };
+      } else {
+        measurements[`${type}Width`] = {
+          ...measurements[`${type}Width`],
+          mm: correctedMm,
+          cm: correctedCm
+        };
+      }
+      const rawCm = rawMeasurements.frontWidthsMm[type] / 10;
+      console.log(`[${type}] Corrected: ${correctedCm.toFixed(1)}cm (was ${rawCm.toFixed(1)}cm)`);
+    });
+    
+    Object.keys(correctedMeasurements.sideDepthsMm).forEach(type => {
+      let correctedMm = correctedMeasurements.sideDepthsMm[type] || rawMeasurements.sideDepthsMm[type];
+      
+      // Validate corrected value
+      if (!isFinite(correctedMm) || correctedMm <= 0) {
+        console.warn(`[${type} depth] Invalid corrected value: ${correctedMm}, using raw value`);
+        const rawMm = rawMeasurements.sideDepthsMm[type];
+        if (isFinite(rawMm) && rawMm > 0) {
+          correctedMm = rawMm; // Fallback to raw value
+        } else {
+          console.error(`[${type} depth] Raw value also invalid: ${rawMm}, skipping`);
+          return; // Skip this measurement
+        }
+      }
+      
+      const correctedCm = correctedMm / 10;
+      measurements[`${type}Depth`] = {
+        ...measurements[`${type}Depth`],
+        mm: correctedMm,
+        cm: correctedCm
+      };
+      const rawCm = rawMeasurements.sideDepthsMm[type] / 10;
+      console.log(`[${type}] Corrected: ${correctedCm.toFixed(1)}cm (was ${rawCm.toFixed(1)}cm)`);
+    });
+
+    // Step 3: Finalize bands with symmetric coupling and plausibility checks
+    // Use finalizeBand for all measurements (applies symmetric clamping in one place)
+    const finalizedMeasurements = {
+      frontWidthsMm: { ...correctedMeasurements.frontWidthsMm },
+      sideDepthsMm: { ...correctedMeasurements.sideDepthsMm },
+      circumferencesMm: {},
+      areasMm2: {}
+    };
+    
     const all3DTypes = ['chest', 'waist', 'hips', 'thighs', 'calves'];
+    // Track co-registration stats
+    const coRegStats = { total: 0, sumDeltaY: 0 };
+    
     all3DTypes.forEach(type => {
-      const width = type === 'thighs' ? measurements.thighsWidth : 
-                    type === 'calves' ? measurements.calvesWidth :
-                    measurements[`${type}Width`];
-      const depth = measurements[`${type}Depth`];
-      console.log(`[${type} 3D] Width:`, width, "Depth:", depth);
-      if (width && depth) {
+      const result = finalizeBand(finalizedMeasurements, type);
+      if (result) {
+        // Update measurements with finalized values
+        const width = {
+          mm: result.width,
+          cm: result.width / 10
+        };
+        const depth = {
+          mm: result.depth,
+          cm: result.depth / 10
+        };
+        
+        // Instrumentation: log compact per-band info
+        const wRaw = rawMeasurements.frontWidthsMm[type] || 0;
+        const dRaw = rawMeasurements.sideDepthsMm[type] || 0;
+        const wFinal = result.width;
+        const dFinal = result.depth;
+        const cFinal = result.circumference / 10; // cm
+        const flags = finalizedMeasurements.flags?.[type] || {};
+        const flagStr = flags.wdSuspicious ? 'wdSuspicious' : 'ok';
+        const r = type === 'shoulders' ? 0.30 : type === 'chest' ? 0.38 : type === 'waist' ? 0.46 : type === 'hips' ? 0.55 : 0.70;
+        console.log(`[b] ${type} r=${r.toFixed(2)} Wraw=${(wRaw/10).toFixed(1)}mm Draw=${(dRaw/10).toFixed(1)}mm yaw=${rad2deg(yawFrontRad).toFixed(1)}° pitchS=${rad2deg(pitchSideRad).toFixed(1)}°`);
+        console.log(` -> W=${(wFinal/10).toFixed(1)}mm D=${(dFinal/10).toFixed(1)}mm C=${cFinal.toFixed(1)}cm flags: ${flagStr}`);
+        
+        // Calculate 3D measurements using finalized values
         const type3D = calculate3D(width, depth, type);
         if (type3D) {
+          // Update with finalized circumference and area
+          type3D.circumference = {
+            cm: Math.round((result.circumference / 10) * 10) / 10,
+            mm: Math.round(result.circumference)
+          };
+          type3D.crossSectionalArea = {
+            cm2: Math.round((result.area / 100) * 10) / 10,
+            mm2: Math.round(result.area)
+          };
           measurements[`${type}3D`] = type3D;
-          console.log(`[${type} 3D] Calculated:`, type3D);
-        } else {
-          console.log(`[${type} 3D] Failed to calculate - calculate3D returned null`);
         }
       } else {
-        console.log(`[${type} 3D] Failed to calculate - missing width or depth. Width:`, width, "Depth:", depth);
+        // Fallback to original calculation if finalizeBand returns null
+        const width = type === 'thighs' ? measurements.thighsWidth : 
+                      type === 'calves' ? measurements.calvesWidth :
+                      measurements[`${type}Width`];
+        const depth = measurements[`${type}Depth`];
+        if (width && depth && width.mm && depth.mm && isFinite(width.mm) && isFinite(depth.mm) && width.mm > 0 && depth.mm > 0) {
+          const type3D = calculate3D(width, depth, type);
+          if (type3D) {
+            measurements[`${type}3D`] = type3D;
+            console.log(`[${type} 3D] Calculated (fallback):`, type3D);
+          }
+        }
       }
     });
 
@@ -2540,6 +2893,137 @@ export default function App() {
     }
   };
 
+  // Export measurements with enhanced schema (includes angles, flags, co-registration ratios)
+  const exportMeasurements = () => {
+    if (!bodyMeasurements) {
+      alert("No measurements to export. Please calculate measurements first.");
+      return;
+    }
+
+    // Recalculate finalized measurements to get flags
+    const tempMeasurements = calculateManualMeasurements();
+    if (!tempMeasurements) {
+      alert("Failed to recalculate measurements for export.");
+      return;
+    }
+
+    const timestamp = new Date().toISOString().split('T')[0];
+    const exportData = {
+      image_ids: {
+        front: `front_${timestamp}`,
+        side: `side_${timestamp}`
+      },
+      height_cm: heightCm,
+      calibration: {
+        front: {
+          mm_per_px: frontScaleMmPerPx || null,
+          tilt_applied: frontTiltApplied,
+          pitch_rad: frontPitch,
+          yaw_rad: frontYawSmoothed,
+          head_px: frontHeadYPx,
+          heel_px: frontHeelYPx
+        },
+        side: {
+          mm_per_px: sideScaleMmPerPx || null,
+          tilt_applied: sideTiltApplied,
+          pitch_rad: sidePitch,
+          yaw_rad: 0.00, // Side photos don't have yaw
+          head_px: sideHeadYPx,
+          heel_px: sideHeelYPx
+        }
+      },
+      dots: {
+        front: [],
+        side: []
+      },
+      bands: {
+        ratios: {
+          shoulders: 0.30,
+          chest: 0.38,
+          waist: 0.46,
+          hips: 0.55,
+          thighs: 0.70,
+          calves: 0.80
+        }
+      },
+      measurements_mm: {
+        front_widths: {},
+        side_depths: {},
+        circumference: {},
+        area_mm2: {}
+      },
+      flags: {},
+      version: "manual-v2.3"
+    };
+
+    // Export dots
+    ['shoulders', 'chest', 'waist', 'hips', 'thighs', 'calves', 'knee'].forEach(type => {
+      if (manualDots.front[type]) {
+        Object.keys(manualDots.front[type]).forEach(side => {
+          const dot = manualDots.front[type][side];
+          if (dot) {
+            exportData.dots.front.push({
+              x: Math.round(dot.x),
+              y: Math.round(dot.y),
+              part: `${type}_${side}`
+            });
+          }
+        });
+      }
+    });
+
+    ['chest', 'waist', 'hips', 'thighs', 'calves'].forEach(type => {
+      if (manualDots.side[type]) {
+        Object.keys(manualDots.side[type]).forEach(side => {
+          const dot = manualDots.side[type][side];
+          if (dot) {
+            exportData.dots.side.push({
+              x: Math.round(dot.x),
+              y: Math.round(dot.y),
+              part: `${type}_${side}`
+            });
+          }
+        });
+      }
+    });
+
+    // Export measurements
+    ['shoulders', 'chest', 'waist', 'hips', 'thighs', 'calves'].forEach(type => {
+      const width = bodyMeasurements.widths?.[type];
+      const depth = bodyMeasurements.depths?.[type];
+      const threeD = bodyMeasurements[type];
+
+      if (width?.mm) exportData.measurements_mm.front_widths[type] = width.mm;
+      if (depth?.mm) exportData.measurements_mm.side_depths[type] = depth.mm;
+      if (threeD?.circumference?.mm) exportData.measurements_mm.circumference[type] = threeD.circumference.mm;
+      if (threeD?.crossSectionalArea?.mm2) exportData.measurements_mm.area_mm2[type] = threeD.crossSectionalArea.mm2;
+
+      // Export flags (wdSuspicious, etc.) - recalculate to get flags
+      // We'll need to store flags in state or recalculate here
+      // For now, calculate W/D ratio to determine if suspicious
+      if (width?.mm && depth?.mm) {
+        const wdRatio = Math.max(width.mm, depth.mm) / Math.min(width.mm, depth.mm);
+        exportData.flags[type] = {
+          wdSuspicious: wdRatio > 1.60
+        };
+      }
+    });
+
+    // Download as JSON
+    const jsonStr = JSON.stringify(exportData, null, 2);
+    const blob = new Blob([jsonStr], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `measurements_${timestamp}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    
+    console.log("Exported measurements:", exportData);
+  };
+
   // Submit to proceed to side capture (resets camera view but keeps scale)
   const handleSubmit = async () => {
     // Segment front photo before moving to side
@@ -2573,54 +3057,7 @@ export default function App() {
 
   // Start page component
   if (mode === "select") {
-    return (
-      <div style={{background:"#0b1220", color:"#e5e7eb", minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center"}}>
-        <div style={{maxWidth:600, margin:"0 auto", padding:32, textAlign:"center"}}>
-          <h1 style={{fontSize:36, marginBottom:16}}>Body Measurement Tool</h1>
-          <p style={{fontSize:18, opacity:0.8, marginBottom:48}}>Choose your measurement method</p>
-          
-          <div style={{display:"flex", gap:24, justifyContent:"center", flexWrap:"wrap"}}>
-            <button
-              onClick={() => setMode("pose")}
-              style={{
-                padding: "24px 48px",
-                fontSize: 20,
-                background: "#10b981",
-                color: "white",
-                border: "none",
-                borderRadius: 12,
-                cursor: "pointer",
-                fontWeight: "bold",
-                minWidth: 240,
-                boxShadow: "0 4px 6px rgba(0,0,0,0.3)"
-              }}
-            >
-              🤖 Pose Estimation
-              <div style={{fontSize:14, marginTop:8, opacity:0.9}}>Automatic AI detection</div>
-            </button>
-            
-            <button
-              onClick={() => setMode("manual")}
-              style={{
-                padding: "24px 48px",
-                fontSize: 20,
-                background: "#3b82f6",
-                color: "white",
-                border: "none",
-                borderRadius: 12,
-                cursor: "pointer",
-                fontWeight: "bold",
-                minWidth: 240,
-                boxShadow: "0 4px 6px rgba(0,0,0,0.3)"
-              }}
-            >
-              ✏️ Manual Drawing
-              <div style={{fontSize:14, marginTop:8, opacity:0.9}}>Place dots manually</div>
-            </button>
-          </div>
-        </div>
-      </div>
-    );
+    return <ModeSelector onSelectMode={setMode} />;
   }
 
   return (
@@ -3758,7 +4195,15 @@ export default function App() {
         )}
 
         {/* Display detected body measurements */}
-        {bodyMeasurements && (
+        <MeasurementDisplay 
+          bodyMeasurements={bodyMeasurements} 
+          mode={mode} 
+          useInches={useInches} 
+          setUseInches={setUseInches}
+        />
+        
+        {/* Legacy measurement display - will be removed after component is fully integrated */}
+        {false && bodyMeasurements && (
           <div style={{
             marginTop: 24,
             padding: 20,
@@ -3855,9 +4300,15 @@ export default function App() {
                         <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 8}}>
                           <div>
                             <div style={{fontSize: 10, opacity: 0.6}}>Circumference</div>
-                            <div style={{fontSize: 14, fontWeight: "bold"}}>{formatMeasurement(measurement.circumference.cm).main}</div>
-                            {formatMeasurement(measurement.circumference.cm).sub && (
-                              <div style={{fontSize: 9, opacity: 0.5}}>{formatMeasurement(measurement.circumference.cm).sub}</div>
+                            {measurement.circumference && isFinite(measurement.circumference.cm) && measurement.circumference.cm > 0 ? (
+                              <>
+                                <div style={{fontSize: 14, fontWeight: "bold"}}>{formatMeasurement(measurement.circumference.cm).main}</div>
+                                {formatMeasurement(measurement.circumference.cm).sub && (
+                                  <div style={{fontSize: 9, opacity: 0.5}}>{formatMeasurement(measurement.circumference.cm).sub}</div>
+                                )}
+                              </>
+                            ) : (
+                              <div style={{fontSize: 14, fontWeight: "bold", color: "#ef4444"}}>—</div>
                             )}
                           </div>
                           <div>
@@ -3962,9 +4413,15 @@ export default function App() {
                         <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 8}}>
                           <div>
                             <div style={{fontSize: 10, opacity: 0.6}}>Circumference</div>
-                            <div style={{fontSize: 14, fontWeight: "bold"}}>{formatMeasurement(measurement.circumference.cm).main}</div>
-                            {formatMeasurement(measurement.circumference.cm).sub && (
-                              <div style={{fontSize: 9, opacity: 0.5}}>{formatMeasurement(measurement.circumference.cm).sub}</div>
+                            {measurement.circumference && isFinite(measurement.circumference.cm) && measurement.circumference.cm > 0 ? (
+                              <>
+                                <div style={{fontSize: 14, fontWeight: "bold"}}>{formatMeasurement(measurement.circumference.cm).main}</div>
+                                {formatMeasurement(measurement.circumference.cm).sub && (
+                                  <div style={{fontSize: 9, opacity: 0.5}}>{formatMeasurement(measurement.circumference.cm).sub}</div>
+                                )}
+                              </>
+                            ) : (
+                              <div style={{fontSize: 14, fontWeight: "bold", color: "#ef4444"}}>—</div>
                             )}
                           </div>
                           <div>

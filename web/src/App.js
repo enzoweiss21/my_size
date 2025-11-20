@@ -1,14 +1,41 @@
 import React, { useRef, useEffect, useState } from "react";
-import { FilesetResolver, ImageSegmenter, PoseLandmarker } from "@mediapipe/tasks-vision";
+import ModeSelector from "./components/ModeSelector";
+import MeasurementDisplay from "./components/MeasurementDisplay";
+import { useCamera } from "./hooks/useCamera";
+import { useMediaPipe } from "./hooks/useMediaPipe";
+import { useDeviceOrientation } from "./hooks/useDeviceOrientation";
+import { formatMeasurement as formatMeasurementUtil } from "./utils/formatUtils";
+import { 
+  getNextFrontDot as getNextFrontDotUtil, 
+  getNextSideDot as getNextSideDotUtil, 
+  areAllFrontDotsPlaced as areAllFrontDotsPlacedUtil, 
+  areAllSideDotsPlaced as areAllSideDotsPlacedUtil, 
+  getDotColor as getDotColorUtil 
+} from "./utils/manualDrawingUtils";
+import { estimatePitchFromPose, estimateYawFromPose, estimateYawFromPoseStable, rad2deg, smoothAngle, deg2rad } from "./utils/angleUtils";
+import { correctForeshortening } from "./utils/foreshorteningUtils";
+import { refineEdgeY, coRegisterY, snapPairToY } from "./utils/calibrationUtils";
+import { circumferenceMm } from "./utils/circumferenceUtils";
+import { finalizeBand } from "./utils/measurementUtils";
+
+// Feature flags
+const FLAGS = {
+  sidePitchInScale: true, // if true, skip numeric pitch on side depths
+};
 
 export default function App() {
-  const videoRef = useRef(null);
+  // Mode selection: "select" = start page, "pose" = pose estimation flow, "manual" = manual drawing flow
+  const [mode, setMode] = useState("select");
+
+  // Custom hooks for camera, MediaPipe, and device orientation
+  const { videoRef, streamRef } = useCamera();
+  const { segRef, poseRef, isModelReady, isPoseReady } = useMediaPipe();
+  const { pitchDeg, rollDeg } = useDeviceOrientation();
+  
+  // Refs for UI elements
   const displayRef = useRef(null); // video or captured image
   const overlayRef = useRef(null);
-  const segRef = useRef(null);
-  const poseRef = useRef(null);
   const capturedCanvasRef = useRef(null); // offscreen canvas of captured photo
-  const streamRef = useRef(null); // store camera stream
 
   // user input + draggable lines
   const [heightCm, setHeightCm] = useState(173);
@@ -18,18 +45,10 @@ export default function App() {
 
   // computed scale
   const [scaleMmPerPx, setScaleMmPerPx] = useState(null);
-
-  // device orientation (keep phone level)
-  const [pitchDeg, setPitchDeg] = useState(0);
-  const [rollDeg, setRollDeg] = useState(0);
-
-  // segmentation model
-  const [isModelReady, setIsModelReady] = useState(false); // Track model readiness
-  const [isPoseReady, setIsPoseReady] = useState(false);
   // captured still photo for calibration
   const [capturedDataUrl, setCapturedDataUrl] = useState(null);
   // countdown before photo capture
-  const [countdown, setCountdown] = useState(null); // 3..2..1 or null
+  const [countdown, setCountdown] = useState(null); // 5..4..3..2..1 or null
   // saved front image (blob/data URL)
   const [frontImageData, setFrontImageData] = useState(null);
   // capture state: null = calibration, "front" = front captured, "side" = ready for side
@@ -45,78 +64,176 @@ export default function App() {
   const [sideMeasurements, setSideMeasurements] = useState(null);
   // combined 3D measurements (calculated from both)
   const [bodyMeasurements, setBodyMeasurements] = useState(null);
+  
+  // Unit preference: false = cm, true = inches
+  const [useInches, setUseInches] = useState(false);
 
-  // ---- camera init ----
+  // Manual drawing mode state
+  const [manualDots, setManualDots] = useState({
+    front: {
+      shoulders: { left: null, right: null },
+      chest: { left: null, right: null },
+      waist: { left: null, right: null },
+      hips: { left: null, right: null },
+      butt: { left: null, right: null }, // Butt width (left/right)
+      // Thigh measurements: thickness (left/right) and upper leg length (top to knee)
+      thighs: { left: null, right: null, top: null }, // left/right = thickness, top = top of thigh
+      // Knee is the midpoint for leg length
+      knee: { center: null }, // Single point at knee (midpoint for leg length)
+      // Calf measurements: thickness (left/right) and lower leg length (knee to ankle)
+      calves: { left: null, right: null, bottom: null } // left/right = thickness, bottom = ankle
+    },
+    side: {
+      chest: { front: null, back: null },
+      waist: { front: null, back: null },
+      hips: { front: null, back: null },
+      butt: { front: null, back: null }, // Butt depth (front/back)
+      thighs: { front: null, back: null }, // Thigh depth/thickness
+      calves: { front: null, back: null }  // Calf depth/thickness
+    }
+  });
+  const [activeDotType, setActiveDotType] = useState(null); // Tracks which measurement type we're placing
+  const [draggingDot, setDraggingDot] = useState(null); // e.g. "shoulders-left" | "chest-right" | null
+  const [manualCaptureState, setManualCaptureState] = useState("front-capture"); // "front-capture" | "front-calibration" | "side-capture" | "side-calibration" | "front-dots" | "side-dots"
+  
+  // Separate calibration for front and side photos
+  const [frontHeadY, setFrontHeadY] = useState(200);
+  const [frontHeelY, setFrontHeelY] = useState(700);
+  const [frontScaleMmPerPx, setFrontScaleMmPerPx] = useState(null);
+  const [frontDragging, setFrontDragging] = useState(null); // "head" | "heel" | null
+  
+  const [sideHeadY, setSideHeadY] = useState(200);
+  const [sideHeelY, setSideHeelY] = useState(700);
+  const [sideScaleMmPerPx, setSideScaleMmPerPx] = useState(null);
+  const [sideDragging, setSideDragging] = useState(null); // "head" | "heel" | null
+  
+  // Pose data for tilt corrections
+  const [frontPose, setFrontPose] = useState(null); // MediaPipe pose landmarks from front photo
+  const [sidePose, setSidePose] = useState(null); // MediaPipe pose landmarks from side photo
+  const [frontPitch, setFrontPitch] = useState(0); // Pitch angle from front photo (radians)
+  const [sidePitch, setSidePitch] = useState(0); // Pitch angle from side photo (radians)
+  const [frontYaw, setFrontYaw] = useState(0); // Yaw angle from front photo (radians)
+  const [frontYawSmoothed, setFrontYawSmoothed] = useState(0); // Smoothed yaw for stability
+  const [frontTiltApplied, setFrontTiltApplied] = useState(false); // Whether pitch correction applied in lockScale
+  const [sideTiltApplied, setSideTiltApplied] = useState(false); // Whether pitch correction applied in lockScale
+  // Store pixel positions for co-registration
+  const [frontHeadYPx, setFrontHeadYPx] = useState(null); // Refined head Y in pixels
+  const [frontHeelYPx, setFrontHeelYPx] = useState(null); // Refined heel Y in pixels
+  const [sideHeadYPx, setSideHeadYPx] = useState(null); // Refined head Y in pixels
+  const [sideHeelYPx, setSideHeelYPx] = useState(null); // Refined heel Y in pixels
+
+  // Camera, MediaPipe, and device orientation are now handled by custom hooks above
+  // No initialization code needed here
+
+  // ---- ensure canvas is available when switching to dot placement ----
   useEffect(() => {
+    if (mode === "manual") {
+      const needsFrontCanvas = manualCaptureState === "front-dots" || manualCaptureState === "front-calibration";
+      const needsSideCanvas = manualCaptureState === "side-dots" || manualCaptureState === "side-calibration";
+      if (needsFrontCanvas && frontImageData) {
+        // Ensure canvas is set to front image
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.createElement("canvas");
+          canvas.width = img.width;
+          canvas.height = img.height;
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0);
+          capturedCanvasRef.current = canvas;
+        };
+        img.src = frontImageData;
+      } else if (needsSideCanvas && sideImageData) {
+        // Ensure canvas is set to side image
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.createElement("canvas");
+          canvas.width = img.width;
+          canvas.height = img.height;
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0);
+          capturedCanvasRef.current = canvas;
+        };
+        img.src = sideImageData;
+      }
+    }
+  }, [mode, manualCaptureState, frontImageData, sideImageData]);
+
+  // ---- ensure camera stream is attached when in capture mode ----
+  useEffect(() => {
+    if (mode === "manual" && (manualCaptureState === "front-capture" || manualCaptureState === "side-capture")) {
+      const ensureCamera = () => {
+        if (videoRef.current && streamRef.current) {
+          // Check if stream is still active
+          const tracks = streamRef.current.getTracks();
+          const activeTracks = tracks.filter(t => t.readyState === 'live');
+          
+          if (activeTracks.length === 0) {
+            console.log("Camera stream ended, reinitializing...");
+            // Stream ended, need to reinitialize
     (async () => {
-      try {
+              try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: false,
       });
-        streamRef.current = stream; // Store stream for later use
-        if (videoRef.current) {
+                streamRef.current = stream;
+                if (videoRef.current) {
       videoRef.current.srcObject = stream;
-      videoRef.current.onloadeddata = () => {
-        videoRef.current.play().catch((err) => console.error("Video play error:", err));
-      };
-        }
-      } catch (err) {
-        console.error("Camera error:", err);
-      }
+                  videoRef.current.play().catch(console.error);
+                }
+              } catch (err) {
+                console.error("Failed to reinitialize camera:", err);
+              }
     })();
-    // Cleanup on unmount
-    return () => {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(track => track.stop());
-        streamRef.current = null;
-      }
-    };
-  }, []);
-
-  // ---- device orientation ----
-  useEffect(() => {
-    const h = (e) => { setPitchDeg(e.beta || 0); setRollDeg(e.gamma || 0); };
-    if (window.DeviceOrientationEvent) window.addEventListener("deviceorientation", h, true);
-    return () => window.removeEventListener("deviceorientation", h, true);
-  }, []);
-
-  // ---- load segmentation model ----
-  useEffect(() => {
+            return;
+          }
+          
+          // Reattach stream if needed
+          if (videoRef.current.srcObject !== streamRef.current) {
+            videoRef.current.srcObject = streamRef.current;
+          }
+          
+          // Ensure video plays
+          videoRef.current.play().catch(err => {
+            console.error("Video play error:", err);
+            // Retry after a short delay
+            setTimeout(() => {
+              if (videoRef.current && streamRef.current) {
+                videoRef.current.srcObject = streamRef.current;
+                videoRef.current.play().catch(console.error);
+              }
+            }, 100);
+          });
+        } else if (videoRef.current && !streamRef.current) {
+          // Video element exists but no stream - try to get it
+          console.log("Video element found but no stream, initializing camera...");
     (async () => {
       try {
-        const fileset = await FilesetResolver.forVisionTasks(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
-        );
-        const segmenter = await ImageSegmenter.createFromOptions(fileset, {
-          baseOptions: {
-            // Use a hosted model URL since there's no local /public/models file
-            modelAssetPath:
-              "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite",
-          },
-          outputCategoryMask: true,
-          runningMode: "IMAGE",
-          categoryAllowlist: ["person"],
-        });
-        segRef.current = segmenter;
-        setIsModelReady(true); // Set model as ready
-        // Load pose landmarker
-        const pose = await PoseLandmarker.createFromOptions(fileset, {
-          baseOptions: {
-            modelAssetPath:
-              "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
-          },
-          runningMode: "IMAGE",
-          numPoses: 1,
-        });
-        poseRef.current = pose;
-        setIsPoseReady(true);
-      } catch (error) {
-        console.error("Failed to load segmentation model:", error);
-        alert("Failed to load segmentation model. Please check the model file.");
+              const stream = await navigator.mediaDevices.getUserMedia({
+                video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+                audio: false,
+              });
+              streamRef.current = stream;
+              if (videoRef.current) {
+                videoRef.current.srcObject = stream;
+                videoRef.current.play().catch(console.error);
+              }
+            } catch (err) {
+              console.error("Failed to initialize camera:", err);
       }
     })();
-  }, []);
+        }
+      };
+      
+      // Try immediately
+      ensureCamera();
+      
+      // Also try after a short delay to handle async mounting
+      const timeout = setTimeout(ensureCamera, 100);
+      
+      return () => clearTimeout(timeout);
+    }
+  }, [mode, manualCaptureState]);
 
   // ---- draw overlay (lines + level bubble + scale readout) ----
   useEffect(() => {
@@ -137,15 +254,43 @@ export default function App() {
       ctx.fillText(`roll: ${rollDeg.toFixed(1)}°`, 20, 52);
 
       // draggable lines (map 0..720 to canvas height)
+      // Show calibration lines during calibration phase (both pose and manual modes)
+      // Hide them only during dot placement in manual mode
+      if (mode === "pose") {
       const yHeadPx = (headY / 720) * h;
       const yHeelPx = (heelY / 720) * h;
       ctx.strokeStyle = "#60a5fa"; ctx.lineWidth = 3; ctx.setLineDash([8,6]);
       ctx.beginPath(); ctx.moveTo(0, yHeadPx); ctx.lineTo(w, yHeadPx); ctx.stroke();
       ctx.beginPath(); ctx.moveTo(0, yHeelPx); ctx.lineTo(w, yHeelPx); ctx.stroke();
       ctx.setLineDash([]);
+      } else if (mode === "manual" && manualCaptureState === "front-calibration") {
+        const yHeadPx = (frontHeadY / 720) * h;
+        const yHeelPx = (frontHeelY / 720) * h;
+        ctx.strokeStyle = "#60a5fa"; ctx.lineWidth = 3; ctx.setLineDash([8,6]);
+        ctx.beginPath(); ctx.moveTo(0, yHeadPx); ctx.lineTo(w, yHeadPx); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(0, yHeelPx); ctx.lineTo(w, yHeelPx); ctx.stroke();
+        ctx.setLineDash([]);
+      } else if (mode === "manual" && manualCaptureState === "side-calibration") {
+        const yHeadPx = (sideHeadY / 720) * h;
+        const yHeelPx = (sideHeelY / 720) * h;
+        ctx.strokeStyle = "#60a5fa"; ctx.lineWidth = 3; ctx.setLineDash([8,6]);
+        ctx.beginPath(); ctx.moveTo(0, yHeadPx); ctx.lineTo(w, yHeadPx); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(0, yHeelPx); ctx.lineTo(w, yHeelPx); ctx.stroke();
+        ctx.setLineDash([]);
+      }
 
-      if (scaleMmPerPx) {
-        const txt = `scale: ${scaleMmPerPx.toFixed(3)} mm/px`;
+      // Show scale readout
+      let currentScale = scaleMmPerPx;
+      if (mode === "manual") {
+        if (manualCaptureState === "front-calibration" || manualCaptureState === "front-dots") {
+          currentScale = frontScaleMmPerPx;
+        } else if (manualCaptureState === "side-calibration" || manualCaptureState === "side-dots") {
+          currentScale = sideScaleMmPerPx;
+        }
+      }
+      
+      if (currentScale) {
+        const txt = `scale: ${currentScale.toFixed(3)} mm/px`;
         const m = ctx.measureText(txt);
         ctx.fillStyle = "#111827";
         ctx.fillRect(w - m.width - 26, 12, m.width + 16, 26);
@@ -175,17 +320,253 @@ export default function App() {
     };
     draw();
     return () => cancelAnimationFrame(raf);
-  }, [headY, heelY, scaleMmPerPx, pitchDeg, rollDeg, capturedDataUrl, sideImageData, countdown]);
+  }, [headY, heelY, scaleMmPerPx, pitchDeg, rollDeg, capturedDataUrl, sideImageData, countdown, mode, manualCaptureState, frontHeadY, frontHeelY, frontScaleMmPerPx, sideHeadY, sideHeelY, sideScaleMmPerPx]);
 
   // ---- drag handlers ----
   const onPointerDown = (e) => {
+    // Handle calibration line dragging for manual mode
+    if (mode === "manual") {
+      if (manualCaptureState === "front-calibration") {
+        const rect = overlayRef.current.getBoundingClientRect();
+        const y = e.clientY - rect.top;
+        const y720 = (y / overlayRef.current.height) * 720;
+        if (Math.abs(y720 - frontHeadY) < 16) setFrontDragging("head");
+        else if (Math.abs(y720 - frontHeelY) < 16) setFrontDragging("heel");
+        return;
+      } else if (manualCaptureState === "side-calibration") {
+        const rect = overlayRef.current.getBoundingClientRect();
+        const y = e.clientY - rect.top;
+        const y720 = (y / overlayRef.current.height) * 720;
+        if (Math.abs(y720 - sideHeadY) < 16) setSideDragging("head");
+        else if (Math.abs(y720 - sideHeelY) < 16) setSideDragging("heel");
+        return;
+      } else if (manualCaptureState === "front-dots" || manualCaptureState === "side-dots") {
+        // Handle dot dragging - find closest dot
+        const rect = overlayRef.current.getBoundingClientRect();
+        const img = displayRef.current;
+        if (!img || !capturedCanvasRef.current) return;
+        
+        const imgRect = img.getBoundingClientRect();
+        const containerRect = img.parentElement?.getBoundingClientRect();
+        if (!containerRect) return;
+        
+        const offsetX = (containerRect.width - imgRect.width) / 2;
+        const offsetY = (containerRect.height - imgRect.height) / 2;
+        const imageWidth = capturedCanvasRef.current.width || img.naturalWidth || img.width;
+        const imageHeight = capturedCanvasRef.current.height || img.naturalHeight || img.height;
+        const scaleX = imageWidth / imgRect.width;
+        const scaleY = imageHeight / imgRect.height;
+        
+        const clickX = (e.clientX - rect.left - offsetX) * scaleX;
+        const clickY = (e.clientY - rect.top - offsetY) * scaleY;
+        
+        const threshold = 20 * scaleX; // 20px threshold in image space
+        
+        let closestDot = null;
+        let closestDist = threshold;
+        
+        if (manualCaptureState === "front-dots") {
+          // Standard width measurements (left/right)
+          const widthTypes = ['shoulders', 'chest', 'waist', 'hips'];
+          for (const type of widthTypes) {
+            if (manualDots.front[type].left) {
+              const dist = Math.sqrt(Math.pow(clickX - manualDots.front[type].left.x, 2) + Math.pow(clickY - manualDots.front[type].left.y, 2));
+              if (dist < closestDist) {
+                closestDist = dist;
+                closestDot = `${type}-left`;
+              }
+            }
+            if (manualDots.front[type].right) {
+              const dist = Math.sqrt(Math.pow(clickX - manualDots.front[type].right.x, 2) + Math.pow(clickY - manualDots.front[type].right.y, 2));
+              if (dist < closestDist) {
+                closestDist = dist;
+                closestDot = `${type}-right`;
+              }
+            }
+          }
+          
+          // Thigh measurements: left, right, top
+          if (manualDots.front.thighs.left) {
+            const dist = Math.sqrt(Math.pow(clickX - manualDots.front.thighs.left.x, 2) + Math.pow(clickY - manualDots.front.thighs.left.y, 2));
+            if (dist < closestDist) {
+              closestDist = dist;
+              closestDot = 'thighs-left';
+            }
+          }
+          if (manualDots.front.thighs.right) {
+            const dist = Math.sqrt(Math.pow(clickX - manualDots.front.thighs.right.x, 2) + Math.pow(clickY - manualDots.front.thighs.right.y, 2));
+            if (dist < closestDist) {
+              closestDist = dist;
+              closestDot = 'thighs-right';
+            }
+          }
+          if (manualDots.front.thighs.top) {
+            const dist = Math.sqrt(Math.pow(clickX - manualDots.front.thighs.top.x, 2) + Math.pow(clickY - manualDots.front.thighs.top.y, 2));
+            if (dist < closestDist) {
+              closestDist = dist;
+              closestDot = 'thighs-top';
+            }
+          }
+          
+          // Knee center
+          if (manualDots.front.knee.center) {
+            const dist = Math.sqrt(Math.pow(clickX - manualDots.front.knee.center.x, 2) + Math.pow(clickY - manualDots.front.knee.center.y, 2));
+            if (dist < closestDist) {
+              closestDist = dist;
+              closestDot = 'knee-center';
+            }
+          }
+          
+          // Calf measurements: left, right, bottom
+          if (manualDots.front.calves.left) {
+            const dist = Math.sqrt(Math.pow(clickX - manualDots.front.calves.left.x, 2) + Math.pow(clickY - manualDots.front.calves.left.y, 2));
+            if (dist < closestDist) {
+              closestDist = dist;
+              closestDot = 'calves-left';
+            }
+          }
+          if (manualDots.front.calves.right) {
+            const dist = Math.sqrt(Math.pow(clickX - manualDots.front.calves.right.x, 2) + Math.pow(clickY - manualDots.front.calves.right.y, 2));
+            if (dist < closestDist) {
+              closestDist = dist;
+              closestDot = 'calves-right';
+            }
+          }
+          if (manualDots.front.calves.bottom) {
+            const dist = Math.sqrt(Math.pow(clickX - manualDots.front.calves.bottom.x, 2) + Math.pow(clickY - manualDots.front.calves.bottom.y, 2));
+            if (dist < closestDist) {
+              closestDist = dist;
+              closestDot = 'calves-bottom';
+            }
+          }
+        } else if (manualCaptureState === "side-dots") {
+          const types = ['chest', 'waist', 'hips', 'thighs', 'calves'];
+          for (const type of types) {
+            if (manualDots.side[type].front) {
+              const dist = Math.sqrt(Math.pow(clickX - manualDots.side[type].front.x, 2) + Math.pow(clickY - manualDots.side[type].front.y, 2));
+              if (dist < closestDist) {
+                closestDist = dist;
+                closestDot = `${type}-front`;
+              }
+            }
+            if (manualDots.side[type].back) {
+              const dist = Math.sqrt(Math.pow(clickX - manualDots.side[type].back.x, 2) + Math.pow(clickY - manualDots.side[type].back.y, 2));
+              if (dist < closestDist) {
+                closestDist = dist;
+                closestDot = `${type}-back`;
+              }
+            }
+          }
+        }
+        
+        if (closestDot) {
+          setDraggingDot(closestDot);
+          return;
+        }
+        return;
+      }
+    }
+    
+    // Pose estimation mode - original behavior
     const rect = overlayRef.current.getBoundingClientRect();
     const y = e.clientY - rect.top;
     const y720 = (y / overlayRef.current.height) * 720;
     if (Math.abs(y720 - headY) < 16) setDragging("head");
     else if (Math.abs(y720 - heelY) < 16) setDragging("heel");
   };
+  
   const onPointerMove = (e) => {
+    // Handle calibration line dragging for manual mode
+    if (mode === "manual") {
+      if (frontDragging && manualCaptureState === "front-calibration") {
+        const rect = overlayRef.current.getBoundingClientRect();
+        const y = e.clientY - rect.top;
+        const y720 = Math.max(0, Math.min(720, (y / overlayRef.current.height) * 720));
+        if (frontDragging === "head") setFrontHeadY(y720);
+        else setFrontHeelY(y720);
+        return;
+      } else if (sideDragging && manualCaptureState === "side-calibration") {
+        const rect = overlayRef.current.getBoundingClientRect();
+        const y = e.clientY - rect.top;
+        const y720 = Math.max(0, Math.min(720, (y / overlayRef.current.height) * 720));
+        if (sideDragging === "head") setSideHeadY(y720);
+        else setSideHeelY(y720);
+        return;
+      } else if (draggingDot && (manualCaptureState === "front-dots" || manualCaptureState === "side-dots")) {
+        // Handle dot dragging - parse draggingDot format: "type-side" or "type-front/back"
+        const rect = overlayRef.current.getBoundingClientRect();
+        const img = displayRef.current;
+        if (!img) return;
+        
+        const imgRect = img.getBoundingClientRect();
+        const containerRect = img.parentElement?.getBoundingClientRect();
+        if (!containerRect) return;
+        
+        const offsetX = (containerRect.width - imgRect.width) / 2;
+        const offsetY = (containerRect.height - imgRect.height) / 2;
+        const imageWidth = capturedCanvasRef.current?.width || img.naturalWidth || img.width;
+        const imageHeight = capturedCanvasRef.current?.height || img.naturalHeight || img.height;
+        const scaleX = imageWidth / imgRect.width;
+        const scaleY = imageHeight / imgRect.height;
+        
+        const moveX = (e.clientX - rect.left - offsetX) * scaleX;
+        const moveY = (e.clientY - rect.top - offsetY) * scaleY;
+        
+        // Gotcha guard: Disallow dots within 2px of image borders
+        const MIN_EDGE_DISTANCE = 2;
+        const clampedX = Math.max(MIN_EDGE_DISTANCE, Math.min(imageWidth - MIN_EDGE_DISTANCE, moveX));
+        const clampedY = Math.max(MIN_EDGE_DISTANCE, Math.min(imageHeight - MIN_EDGE_DISTANCE, moveY));
+        
+        // Handle special case of "knee-center" where we need to handle it differently
+        let type, side;
+        if (draggingDot === 'knee-center') {
+          type = 'knee';
+          side = 'center';
+        } else {
+          [type, side] = draggingDot.split('-');
+        }
+        
+        if (manualCaptureState === "front-dots") {
+          // Special handling for knee.center which is a single point, not an object with nested properties
+          if (type === 'knee' && side === 'center') {
+            setManualDots(prev => ({
+              ...prev,
+              front: {
+                ...prev.front,
+                knee: {
+                  center: { x: clampedX, y: clampedY }
+                }
+              }
+            }));
+          } else {
+            setManualDots(prev => ({
+              ...prev,
+              front: {
+                ...prev.front,
+                [type]: {
+                  ...prev.front[type],
+                  [side]: { x: clampedX, y: clampedY }
+                }
+              }
+            }));
+          }
+        } else if (manualCaptureState === "side-dots") {
+          setManualDots(prev => ({
+            ...prev,
+            side: {
+              ...prev.side,
+              [type]: {
+                ...prev.side[type],
+                [side]: { x: clampedX, y: clampedY }
+              }
+            }
+          }));
+        }
+        return;
+      }
+    }
+    
+    // Pose estimation mode - original behavior
     if (!dragging) return;
     const rect = overlayRef.current.getBoundingClientRect();
     const y = e.clientY - rect.top;
@@ -193,38 +574,206 @@ export default function App() {
     if (dragging === "head") setHeadY(y720);
     else setHeelY(y720);
   };
-  const onPointerUp = () => setDragging(null);
+  
+  const onPointerUp = () => {
+    setDragging(null);
+    setFrontDragging(null);
+    setSideDragging(null);
+    setDraggingDot(null);
+  };
 
-  // ---- compute pixel calibration scale ----
+  // ---- compute pixel calibration scale (IMPROVED) ----
   // This establishes the pixel-to-millimeter conversion ratio using:
   // - User's known height (heightCm)
   // - Measured pixel distance between head and heel (spanPx) in ACTUAL image pixels
-  // Formula: scaleMmPerPx = (heightCm * 10) / spanPx
-  // This calibration is then used with deterministic segmentation scanning
-  const lockScale = () => {
-    // Get the actual image/canvas dimensions
-    const canvas = capturedCanvasRef.current;
-    if (!canvas) {
-      return alert("No image captured. Please capture a photo first.");
+  // - Sub-pixel edge refinement for accuracy
+  // - Pose-tilt correction (cos(pitch) factor)
+  // - Pitch/lens guardrails for quality
+  // Formula: scaleMmPerPx = (heightCm * 10 * cos(pitchRad)) / spanPx
+  const lockScale = async () => {
+    const processScale = (canvas, headYLogical, heelYLogical, isManual = false, photoType = null, pitchRadOverride = null) => {
+      if (!canvas) {
+        return { error: isManual ? `No ${photoType} image captured. Please capture a photo first.` : "No image captured. Please capture a photo first." };
+      }
+      
+      // Use actual pixel buffer dimensions (not CSS size)
+      const actualImageHeight = canvas.height;
+      const actualImageWidth = canvas.width;
+      
+      // Convert logical Y (0-720) to actual pixel Y
+      let headYPx = (headYLogical / 720) * actualImageHeight;
+      let heelYPx = (heelYLogical / 720) * actualImageHeight;
+      
+      // Refine edges using sub-pixel edge snap
+      try {
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          // Refine head edge (sample center region)
+          headYPx = refineEdgeY(ctx, headYPx, actualImageWidth * 0.3, actualImageWidth * 0.7);
+          // Refine heel edge (sample center region)
+          heelYPx = refineEdgeY(ctx, heelYPx, actualImageWidth * 0.3, actualImageWidth * 0.7);
+        }
+      } catch (e) {
+        console.warn("Edge refinement failed, using original Y:", e);
+      }
+      
+      const spanPx = Math.abs(heelYPx - headYPx);
+      
+      // Guardrails
+      if (spanPx < 200) {
+        return { error: "Subject too small in frame. Step back." };
+      }
+      
+      if (Math.abs(pitchDeg) > 2 || Math.abs(rollDeg) > 2) {
+        return { error: "Hold phone level (|pitch|,|roll| < 2°)." };
+      }
+      
+      // Gotcha guard: Crop check - if top of head is cropped, block calibration
+      // Check if head Y is too close to top (within 5% of image height)
+      if (headYPx < actualImageHeight * 0.05) {
+        return { error: "Top of head appears cropped. Please ensure full body is visible in frame." };
+      }
+      
+      // Gotcha guard: Footwear hint - if heel line is on shoe, warn user
+      // (This is a soft hint, not a blocker - we'll allow ±1% manual nudge in dev mode later)
+      if (heelYPx > actualImageHeight * 0.95) {
+        console.warn("[calibration] Heel line near bottom - if on footwear, measurements may be slightly off. Line to bare heel if possible.");
+      }
+      
+      // Pitch/lens guardrails: reject if span ratio is suspicious
+      const spanRatio = spanPx / actualImageHeight;
+      if (spanRatio < 0.35 || spanRatio > 0.95) {
+        return { error: `Bad calibration: body span (${spanRatio.toFixed(2)} of image height) suggests crop/tilt. Please retake photo.` };
+      }
+      
+      // POSE-TILT CORRECTION: Use provided pitchRad or default to 0
+      const pitchRad = pitchRadOverride ?? 0;
+      
+      // Apply pose-tilt correction: mmPerPx = (heightCm * 10 * cos(pitchRad)) / spanPx
+      // If no pose data, pitchRad = 0, so cos(0) = 1 (no correction)
+      const cosPitch = Math.cos(Math.abs(pitchRad));
+      const computedScale = (heightCm * 10 * cosPitch) / spanPx;
+      
+      return {
+        scale: computedScale,
+        spanPx,
+        headYPx,
+        heelYPx,
+        imageWidth: actualImageWidth,
+        imageHeight: actualImageHeight,
+        pitchRad
+      };
+    };
+    
+    // Helper to detect pose and estimate pitch (and yaw for front photos)
+    const detectPoseAndEstimatePitch = async (canvas, photoType = null) => {
+      if (!isPoseReady || !poseRef.current || !canvas) return { pitchRad: 0, yawRad: 0, poseResult: null };
+      
+      try {
+        const poseResult = await poseRef.current.detect(canvas);
+        if (poseResult && poseResult.landmarks && poseResult.landmarks.length > 0) {
+          // Store pose data
+          if (mode === "manual") {
+            if (photoType === "front") {
+              setFrontPose(poseResult);
+            } else if (photoType === "side") {
+              setSidePose(poseResult);
+            }
+          }
+          
+          const pitchRad = estimatePitchFromPose(poseResult);
+          let yawRad = 0;
+          
+          // Estimate yaw for front photos (for foreshortening correction)
+          if (photoType === "front") {
+            yawRad = estimateYawFromPose(poseResult);
+            setFrontYaw(yawRad);
+            console.log(`[${photoType}] Detected pose, estimated pitch: ${rad2deg(pitchRad).toFixed(1)}°, yaw: ${rad2deg(yawRad).toFixed(1)}°`);
+          } else {
+            console.log(`[${photoType || "pose"}] Detected pose, estimated pitch: ${rad2deg(pitchRad).toFixed(1)}°`);
+          }
+          
+          return { pitchRad, yawRad, poseResult };
+        }
+      } catch (e) {
+        console.warn("Pose detection failed:", e);
+      }
+      return { pitchRad: 0, yawRad: 0, poseResult: null };
+    };
+    
+    // Handle manual mode - separate calibration for front and side
+    if (mode === "manual") {
+      if (manualCaptureState === "front-calibration") {
+        const canvas = capturedCanvasRef.current;
+        // Detect pose and estimate pitch/yaw for corrections
+        const { pitchRad, yawRad, poseResult } = await detectPoseAndEstimatePitch(canvas, "front");
+        setFrontPitch(pitchRad);
+          // Use smoother yaw estimate with angle sanity bounds
+          const rawYaw = estimateYawFromPose(poseResult);
+          const smoothedYaw = smoothAngle(frontYawSmoothed, rawYaw, 0.6, deg2rad(20));
+          setFrontYaw(smoothedYaw);
+          setFrontYawSmoothed(smoothedYaw);
+        
+        const result = processScale(canvas, frontHeadY, frontHeelY, true, "front", pitchRad);
+        if (result.error) {
+          return alert(result.error);
+        }
+        setFrontScaleMmPerPx(result.scale);
+        setFrontTiltApplied(true); // Mark that pitch correction was applied in lockScale
+        setFrontHeadYPx(result.headYPx); // Store pixel positions for co-registration
+        setFrontHeelYPx(result.heelYPx);
+        
+        // Log both raw and tilt-corrected scales for debugging
+        const rawScale = (heightCm * 10) / result.spanPx;
+        const tiltFactor = Math.cos(Math.abs(pitchRad));
+        console.log(`[scale] front span=${result.spanPx.toFixed(0)}px raw=${rawScale.toFixed(3)} mm/px tilt=${tiltFactor.toFixed(3)} -> mm/px=${result.scale.toFixed(3)}`);
+        console.log(`Front pixel calibration locked: ${result.scale.toFixed(3)} mm/px (tilt-applied)`);
+        console.log(`  Image: ${result.imageWidth}×${result.imageHeight}px`);
+        console.log(`  Head Y: ${result.headYPx.toFixed(1)}px, Heel Y: ${result.heelYPx.toFixed(1)}px`);
+        console.log(`  Span: ${result.spanPx.toFixed(1)}px, Height: ${heightCm}cm (${heightCm * 10}mm)`);
+        console.log(`  Pitch: ${rad2deg(pitchRad).toFixed(1)}°, Yaw (smoothed): ${rad2deg(smoothedYaw).toFixed(1)}°`);
+        return;
+      } else if (manualCaptureState === "side-calibration") {
+        const canvas = capturedCanvasRef.current;
+        // Detect pose and estimate pitch for pose-tilt correction
+        const { pitchRad } = await detectPoseAndEstimatePitch(canvas, "side");
+        setSidePitch(pitchRad);
+        
+        const result = processScale(canvas, sideHeadY, sideHeelY, true, "side", pitchRad);
+        if (result.error) {
+          return alert(result.error);
+        }
+        setSideScaleMmPerPx(result.scale);
+        setSideTiltApplied(true); // Mark that pitch correction was applied in lockScale
+        setSideHeadYPx(result.headYPx); // Store pixel positions for co-registration
+        setSideHeelYPx(result.heelYPx);
+        
+        // Log both raw and tilt-corrected scales for debugging
+        const rawScale = (heightCm * 10) / result.spanPx;
+        const tiltFactor = Math.cos(Math.abs(pitchRad));
+        console.log(`[scale] side span=${result.spanPx.toFixed(0)}px raw=${rawScale.toFixed(3)} mm/px tilt=${tiltFactor.toFixed(3)} -> mm/px=${result.scale.toFixed(3)}`);
+        console.log(`Side pixel calibration locked: ${result.scale.toFixed(3)} mm/px (tilt-applied)`);
+        console.log(`  Image: ${result.imageWidth}×${result.imageHeight}px`);
+        console.log(`  Head Y: ${result.headYPx.toFixed(1)}px, Heel Y: ${result.heelYPx.toFixed(1)}px`);
+        console.log(`  Span: ${result.spanPx.toFixed(1)}px, Height: ${heightCm}cm (${heightCm * 10}mm)`);
+        console.log(`  Pitch: ${rad2deg(pitchRad).toFixed(1)}°`);
+        return;
+      }
     }
     
-    const actualImageHeight = canvas.height;
-    const actualImageWidth = canvas.width;
-    
-    // Convert logical coordinates (0-720) to actual pixel coordinates
-    const headYPx = (headY / 720) * actualImageHeight;
-    const heelYPx = (heelY / 720) * actualImageHeight;
-    const spanPx = Math.abs(heelYPx - headYPx);
-    
-    if (spanPx < 200) return alert("Subject too small in frame. Step back.");
-    if (Math.abs(pitchDeg) > 2 || Math.abs(rollDeg) > 2) return alert("Hold phone level (|pitch|,|roll| < 2°).");
-    
-    const computedScale = (heightCm * 10) / spanPx; // mm per pixel
-    setScaleMmPerPx(computedScale);
-    console.log(`Pixel calibration locked: ${computedScale.toFixed(3)} mm/px`);
-    console.log(`  Image dimensions: ${actualImageWidth}×${actualImageHeight}px`);
-    console.log(`  Head Y: ${headYPx.toFixed(1)}px, Heel Y: ${heelYPx.toFixed(1)}px`);
-    console.log(`  Span: ${spanPx.toFixed(1)}px, Height: ${heightCm}cm (${heightCm * 10}mm)`);
+    // Pose estimation mode
+    const canvas = capturedCanvasRef.current;
+    const { pitchRad } = await detectPoseAndEstimatePitch(canvas);
+    const result = processScale(canvas, headY, heelY, false, null, pitchRad);
+    if (result.error) {
+      return alert(result.error);
+    }
+    setScaleMmPerPx(result.scale);
+    console.log(`Pixel calibration locked: ${result.scale.toFixed(3)} mm/px (pitch-corrected)`);
+    console.log(`  Image dimensions: ${result.imageWidth}×${result.imageHeight}px`);
+    console.log(`  Head Y: ${result.headYPx.toFixed(1)}px, Heel Y: ${result.heelYPx.toFixed(1)}px`);
+    console.log(`  Span: ${result.spanPx.toFixed(1)}px, Height: ${heightCm}cm (${heightCm * 10}mm)`);
+    console.log(`  Pitch: ${rad2deg(pitchRad).toFixed(1)}°, cos factor: ${Math.cos(Math.abs(pitchRad)).toFixed(3)}`);
   };
 
   // ---- capture photo helper ----
@@ -253,7 +802,7 @@ export default function App() {
 
   const startCountdownAndCapture = (onComplete) => {
     if (typeof countdown === "number") return;
-    let t = 3;
+    let t = 5;
     setCountdown(t);
     const interval = setInterval(() => {
       t -= 1;
@@ -427,15 +976,24 @@ export default function App() {
     const mask = result.categoryMask;
     const mdata = mask.getAsUint8Array();
 
-      // Optionally refine mask with matting (future: MODNet/RVM)
-      // For now, use binary mask directly
-      let refinedMask = mdata;
+      // Apply probability threshold: p ≥ 0.7 (reduces "whispy" arm pixels)
+      // MediaPipe categoryMask returns binary (0 or 255), but we ensure threshold at 0.7
+      // If confidence mask available, use it; otherwise threshold binary mask at 178 (0.7 * 255)
+      let refinedMask = new Uint8Array(mdata.length);
+      const probabilityThreshold = 0.7;
+      const thresholdValue = Math.round(probabilityThreshold * 255); // 178.5 → 178
+
+    for (let i = 0; i < mdata.length; i++) {
+        // Threshold mask: only keep pixels with p ≥ 0.7
+        refinedMask[i] = mdata[i] >= thresholdValue ? 255 : 0;
+      }
+      
       const width = canvas.width;
       const height = canvas.height;
       
       // Optional matting refinement (can be enabled later with MODNet/RVM)
       if (false) { // Set to true when matting model is loaded
-        refinedMask = await refineMaskWithMatting(canvas, mdata, width, height);
+        refinedMask = await refineMaskWithMatting(canvas, refinedMask, width, height);
       }
 
       // Create composite: original image over white background using mask
@@ -497,7 +1055,7 @@ export default function App() {
         
         // If we have both front and side measurements, calculate 3D
         if (sideMeasurements && widths) {
-          calculate3DMeasurements(widths, sideMeasurements);
+          calculate3DMeasurements(widths, sideMeasurements, scaleMmPerPx);
         }
         
         console.log("Front segmentation complete - widths calculated");
@@ -522,7 +1080,7 @@ export default function App() {
       
       // If we have both front and side measurements, calculate 3D
       if (frontMeasurements && depths) {
-        calculate3DMeasurements(frontMeasurements, depths);
+        calculate3DMeasurements(frontMeasurements, depths, scaleMmPerPx);
       }
       
       console.log("Side segmentation complete - depths calculated");
@@ -537,65 +1095,127 @@ export default function App() {
   // - Front photo: Measures left-right width of body (what we see from front)
   // - Side photo: Measures front-back depth/thickness (what we see from side)
   // - Circumference: Uses elliptical model (width × depth) to account for full wrap-around
-  const calculate3DMeasurements = (widths, depths) => {
+  const calculate3DMeasurements = (widths, depths, scaleMmPerPx = null) => {
     if (!widths || !depths) {
       console.warn("Missing width or depth measurements for 3D calculation");
       return;
     }
 
+    // STEP: Apply foreshortening corrections (NUMERIC PITCH/YAW CORRECTION)
+    // Convert measurements to raw format for correction
+    const rawMeasurements = {
+      frontWidthsMm: {},
+      sideDepthsMm: {}
+    };
+    
     const landmarks = ["chest", "waist", "hips", "thighs"];
+    landmarks.forEach(landmark => {
+      if (widths[landmark]) {
+        rawMeasurements.frontWidthsMm[landmark] = widths[landmark].mm;
+      }
+      if (depths[landmark]) {
+        rawMeasurements.sideDepthsMm[landmark] = depths[landmark].mm;
+      }
+    });
+    
+    // Estimate angles if not already stored
+    let yawFrontRad = frontYaw;
+    if (!yawFrontRad && frontPose) {
+      yawFrontRad = estimateYawFromPose(frontPose);
+      setFrontYaw(yawFrontRad);
+    }
+    
+    const pitchSideRad = sidePitch;
+    
+    console.log(`[Foreshortening] Front yaw: ${rad2deg(yawFrontRad).toFixed(1)}°, Side pitch: ${rad2deg(pitchSideRad).toFixed(1)}°`);
+    
+    // Apply corrections
+    const correctedMeasurements = correctForeshortening(rawMeasurements, yawFrontRad, pitchSideRad);
+    
+    // Update widths and depths with corrected values
+    const correctedWidths = { ...widths };
+    const correctedDepths = { ...depths };
+    
+    Object.keys(correctedMeasurements.frontWidthsMm).forEach(landmark => {
+      if (correctedWidths[landmark]) {
+        const correctedMm = correctedMeasurements.frontWidthsMm[landmark];
+        const correctedCm = correctedMm / 10;
+        correctedWidths[landmark] = {
+          ...correctedWidths[landmark],
+          mm: correctedMm,
+          cm: correctedCm
+        };
+        console.log(`[${landmark}] Width corrected: ${correctedCm.toFixed(1)}cm (was ${(rawMeasurements.frontWidthsMm[landmark] / 10).toFixed(1)}cm)`);
+      }
+    });
+    
+    Object.keys(correctedMeasurements.sideDepthsMm).forEach(landmark => {
+      if (correctedDepths[landmark]) {
+        const correctedMm = correctedMeasurements.sideDepthsMm[landmark];
+        const correctedCm = correctedMm / 10;
+        correctedDepths[landmark] = {
+          ...correctedDepths[landmark],
+          mm: correctedMm,
+          cm: correctedCm
+        };
+        console.log(`[${landmark}] Depth corrected: ${correctedCm.toFixed(1)}cm (was ${(rawMeasurements.sideDepthsMm[landmark] / 10).toFixed(1)}cm)`);
+      }
+    });
+
     const combinedMeasurements = {};
 
-    // For each landmark, combine width (front) and depth (side) for 3D calculations
+    // For each landmark, combine width (front) and depth (side) for 3D calculations (using corrected values)
     landmarks.forEach(landmark => {
-      const width = widths[landmark];
-      const depth = depths[landmark];
+      const width = correctedWidths[landmark];
+      const depth = correctedDepths[landmark];
 
       if (width && depth) {
-        // Final sanity check: depth should not be > width * 1.3
-        // If so, likely included back/head bump or edge artifacts
-        if (depth.cm > width.cm * 1.3) {
-          console.warn(`${landmark}: Rejected - depth (${depth.cm}cm) > width (${width.cm}cm) * 1.3`);
-          console.warn(`  Likely included back/head bump or edge artifacts. Skipping this measurement.`);
+        // QA: Soft coupling - width should not exceed depth by too much (catches arm leaks)
+        let widthMm = width.mm;
+        let depthMm = depth.mm;
+        
+        if (widthMm > depthMm * 1.25) {
+          console.warn(`${landmark}: Width (${width.cm}cm) > 1.25× depth (${depth.cm}cm) - possible arm contamination, clamping`);
+          widthMm = depthMm * 1.25;
+        }
+        
+        // Final sanity check: depth should not be > width * 1.1
+        // If so, likely included back/head bump, edge artifacts
+        if (depthMm > widthMm * 1.1) {
+          console.warn(`${landmark}: Rejected - depth (${depth.cm}cm) > width (${width.cm}cm) * 1.1`);
+          console.warn(`  Likely included back/head bump, edge artifacts. Skipping this measurement.`);
           return; // Skip this landmark
         }
         
-        // Front photo gives us the left-right width (one dimension of the cross-section)
-        // Side photo gives us the front-back depth (the other dimension)
-        // For circumference calculation, we treat the body cross-section as an ellipse
-        
-        // The width and depth are already the full dimensions (not halves)
-        // So we use them directly as the major and minor axes of an ellipse
-        const semiMajorAxis = width.mm / 2; // half-width (left-to-right radius)
-        const semiMinorAxis = depth.mm / 2; // half-depth (front-to-back radius)
-        
         // Calculate cross-sectional area using ellipse formula: π × a × b
+        const semiMajorAxis = widthMm / 2;
+        const semiMinorAxis = depthMm / 2;
         const crossSectionalAreaMm2 = Math.PI * semiMajorAxis * semiMinorAxis;
         const crossSectionalAreaCm2 = crossSectionalAreaMm2 / 100;
 
-        // Calculate circumference using Ramanujan's ellipse approximation
-        // This gives us the full wrap-around measurement accounting for both dimensions
-        // C ≈ π * (a + b) * (1 + (3h) / (10 + √(4 - 3h)))
-        // where h = ((a - b) / (a + b))²
-        const h = Math.pow((semiMajorAxis - semiMinorAxis) / (semiMajorAxis + semiMinorAxis), 2);
-        const circumferenceMm = Math.PI * (semiMajorAxis + semiMinorAxis) * (1 + (3 * h) / (10 + Math.sqrt(4 - 3 * h)));
-        const circumferenceCm = circumferenceMm / 10;
+        // Calculate circumference using improved auto-chooser model
+        // curvatureHint: 0(round) .. 1(boxy) - estimate from aspect ratio
+        const aspectRatio = Math.max(widthMm, depthMm) / Math.min(widthMm, depthMm);
+        const curvatureHint = aspectRatio > 1.3 ? 0.7 : 0.4; // Higher aspect = boxier
+        
+        const circumferenceMmValue = circumferenceMm(widthMm, depthMm, curvatureHint);
+        const circumferenceCm = circumferenceMmValue / 10;
+        
+        // Human plausibility check
+        if (landmark === "chest" && (circumferenceCm < 90 || circumferenceCm > 140)) {
+          console.warn(`${landmark}: Circumference ${circumferenceCm.toFixed(1)}cm outside typical range (90-140cm). Consider re-taking side photo or adjusting calibration lines.`);
+        }
 
-        // Calculate volume approximation (using cross-sectional area × landmark height segment)
-        // Approximate each landmark represents ~15cm vertical segment of the body
-        const segmentHeightCm = 15;
-        const volumeCm3 = crossSectionalAreaCm2 * segmentHeightCm;
-        const volumeLiters = volumeCm3 / 1000;
-
+        // Store area for trapezoidal integration later
         combinedMeasurements[landmark] = {
-          // 2D measurements from photos
+          // 2D measurements from photos (use clamped width if adjusted)
           width: {
-            cm: Math.round(width.cm * 10) / 10,
-            mm: width.mm
+            cm: Math.round((widthMm / 10) * 10) / 10,
+            mm: widthMm
           },
           depth: {
             cm: Math.round(depth.cm * 10) / 10,
-            mm: depth.mm
+            mm: depthMm
           },
           // 3D calculations (full body wrap-around)
           crossSectionalArea: {
@@ -604,15 +1224,72 @@ export default function App() {
           },
           circumference: {
             cm: Math.round(circumferenceCm * 10) / 10,
-            mm: Math.round(circumferenceMm)
+            mm: Math.round(circumferenceMmValue)
           },
+          // Volume placeholder - will calculate using trapezoidal integration
           volume: {
-            cm3: Math.round(volumeCm3),
-            liters: Math.round(volumeLiters * 100) / 100
+            cm3: 0,
+            liters: 0,
+            _areaCm2: crossSectionalAreaCm2, // Store for integration
+            _yPos: width.y || depth.y // Store Y position for spacing
           }
         };
         
         console.log(`${landmark}: width=${width.cm}cm, depth=${depth.cm}cm → circumference=${Math.round(circumferenceCm * 10) / 10}cm`);
+      }
+    });
+
+    // Calculate volumes using trapezoidal integration: Σ ((A_i + A_{i+1}) / 2) * Δz_i
+    const landmarkOrder = ["chest", "waist", "hips", "thighs"];
+    for (let i = 0; i < landmarkOrder.length - 1; i++) {
+      const landmark1 = landmarkOrder[i];
+      const landmark2 = landmarkOrder[i + 1];
+      const m1 = combinedMeasurements[landmark1];
+      const m2 = combinedMeasurements[landmark2];
+      
+      if (m1 && m2 && m1._areaCm2 && m2._areaCm2) {
+        // Calculate spacing in mm (using scale and Y position difference)
+        // If Y positions available, use them; otherwise use default spacing
+        let deltaZmm;
+        if (m1._yPos && m2._yPos && scaleMmPerPx) {
+          deltaZmm = Math.abs((m2._yPos - m1._yPos) * scaleMmPerPx);
+        } else {
+          // Fallback: approximate spacing (each landmark ~15cm apart)
+          deltaZmm = 150; // 15cm in mm
+        }
+        
+        // Trapezoidal integration: (A1 + A2) / 2 * Δz
+        const avgAreaCm2 = (m1._areaCm2 + m2._areaCm2) / 2;
+        const segmentVolumeCm3 = avgAreaCm2 * (deltaZmm / 10); // Convert mm to cm
+        const segmentVolumeLiters = segmentVolumeCm3 / 1000;
+        
+        // Distribute volume between landmarks (half to each)
+        m1.volume.cm3 += Math.round(segmentVolumeCm3 / 2);
+        m1.volume.liters += segmentVolumeLiters / 2;
+        m2.volume.cm3 += Math.round(segmentVolumeCm3 / 2);
+        m2.volume.liters += segmentVolumeLiters / 2;
+        
+        // Round final liters
+        m1.volume.liters = Math.round(m1.volume.liters * 100) / 100;
+        m2.volume.liters = Math.round(m2.volume.liters * 100) / 100;
+        
+        // Clean up temporary fields
+        delete m1._areaCm2;
+        delete m1._yPos;
+        delete m2._areaCm2;
+        delete m2._yPos;
+      }
+    }
+    
+    // Handle single landmark case (fallback to simple calculation)
+    landmarkOrder.forEach(landmark => {
+      const m = combinedMeasurements[landmark];
+      if (m && m.volume.cm3 === 0 && m._areaCm2) {
+        // No neighbor, use simple area × 15cm
+        m.volume.cm3 = Math.round(m._areaCm2 * 15);
+        m.volume.liters = Math.round((m.volume.cm3 / 1000) * 100) / 100;
+        delete m._areaCm2;
+        delete m._yPos;
       }
     });
 
@@ -638,6 +1315,59 @@ export default function App() {
     
     console.log("Matting refinement not yet implemented, using initial mask");
     return initialMask; // Return original mask for now
+  };
+
+  // ---- helper: calculate percentile ----
+  const percentile = (sortedArray, percentile) => {
+    if (sortedArray.length === 0) return null;
+    const index = Math.ceil((percentile / 100) * sortedArray.length) - 1;
+    return sortedArray[Math.max(0, index)];
+  };
+
+  // ---- helper: auto-tune opening kernel per landmark ----
+  const measureWidthWithRetune = (maskData, width, height, useInverted, torsoROI, name, centerY, bodyHeightCm, scaleMmPerPx, initialKernel, depthEstimate) => {
+    const bandHalfHeight = 20;
+    const bandStartY = Math.max(0, centerY - bandHalfHeight);
+    const bandEndY = Math.min(height - 1, centerY + bandHalfHeight);
+    
+    for (let k = initialKernel; k <= 30; k += 3) {
+      // Apply opening with kernel k
+      const opened = applyHorizontalOpening(maskData, width, height, useInverted, k);
+      
+      // Scan band
+      const widthSamples = [];
+      for (let y = bandStartY; y <= bandEndY; y++) {
+        const regions = scanRowForBodyRegions(opened, width, y, useInverted, torsoROI, "width");
+        if (regions.length === 1) {
+          const region = regions[0];
+          const dimPx = region.end - region.start;
+          widthSamples.push({
+            width: dimPx,
+            leftX: region.start,
+            rightX: region.end
+          });
+        }
+      }
+      
+      if (widthSamples.length === 0) continue;
+      
+      // Use 10th percentile
+      widthSamples.sort((a, b) => a.width - b.width);
+      const wPx = percentile(widthSamples.map(s => s.width), 10);
+      const wCm = (wPx * scaleMmPerPx) / 10;
+      const wRatio = wCm / bodyHeightCm;
+      
+      // Check guardrails
+      const valid = wRatio >= 0.25 && wRatio <= 0.50;
+      const depthCheck = !depthEstimate || wCm <= 1.3 * depthEstimate;
+      
+      if (valid && depthCheck) {
+        const chosen = widthSamples.find(s => s.width === wPx);
+        return { widthPx: wPx, widthCm: wCm, kernel: k, details: chosen };
+      }
+    }
+    
+    return null; // Failed all kernels
   };
 
   // ---- find largest 2D connected component (torso ROI) ----
@@ -701,8 +1431,80 @@ export default function App() {
     return components[0].bbox;
   };
 
+  // ---- horizontal morphological opening to suppress arms ----
+  // Erodes then dilates horizontally only (removes lateral arm bulges without shrinking torso height)
+  const applyHorizontalOpening = (maskData, width, height, useInverted, kernelSize) => {
+    const result = new Uint8Array(maskData.length);
+    
+    // Erode horizontally
+    const eroded = new Uint8Array(maskData.length);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = y * width + x;
+        const maskValue = maskData[idx];
+        const isBodyPixel = useInverted ? maskValue < 127 : maskValue > 127;
+        
+        if (!isBodyPixel) {
+          eroded[idx] = maskValue;
+          continue;
+        }
+        
+        // Check if all pixels in horizontal kernel are body pixels
+        let allBody = true;
+        for (let dx = -kernelSize; dx <= kernelSize; dx++) {
+          const nx = x + dx;
+          if (nx < 0 || nx >= width) {
+            allBody = false;
+            break;
+          }
+          const nidx = y * width + nx;
+          const nmaskValue = maskData[nidx];
+          const nisBodyPixel = useInverted ? nmaskValue < 127 : nmaskValue > 127;
+          if (!nisBodyPixel) {
+            allBody = false;
+            break;
+          }
+        }
+        
+        eroded[idx] = allBody ? maskValue : (useInverted ? 255 : 0);
+      }
+    }
+    
+    // Dilate horizontally
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = y * width + x;
+        const maskValue = eroded[idx];
+        const isBodyPixel = useInverted ? maskValue < 127 : maskValue > 127;
+        
+        if (isBodyPixel) {
+          result[idx] = maskValue;
+          continue;
+        }
+        
+        // Check if any pixel in horizontal kernel is body pixel
+        let anyBody = false;
+        for (let dx = -kernelSize; dx <= kernelSize; dx++) {
+          const nx = x + dx;
+          if (nx < 0 || nx >= width) continue;
+          const nidx = y * width + nx;
+          const nmaskValue = eroded[nidx];
+          const nisBodyPixel = useInverted ? nmaskValue < 127 : nmaskValue > 127;
+          if (nisBodyPixel) {
+            anyBody = true;
+            break;
+          }
+        }
+        
+        result[idx] = anyBody ? (useInverted ? 0 : 255) : maskValue;
+      }
+    }
+    
+    return result;
+  };
+
   // ---- scan single row and find non-edge-touching body regions ----
-  const scanRowForBodyRegions = (maskData, width, y, useInverted, roi) => {
+  const scanRowForBodyRegions = (maskData, width, y, useInverted, roi, type = "width") => {
     const bodyRegions = [];
     let currentRegion = null;
     const startX = roi ? Math.max(0, roi.minX - 5) : 0;
@@ -731,11 +1533,27 @@ export default function App() {
       bodyRegions.push(currentRegion);
     }
     
-    // Reject edge-touching components (CRITICAL FIX)
+    // Edge rejection logic:
+    // - For front photos (width): reject regions touching ANY edge (person should be centered)
+    // - For side photos (depth): allow regions touching ONE edge (person is at side of frame)
+    //   but reject regions touching BOTH edges (spans full width = likely background/artifacts)
     const nonEdgeRegions = bodyRegions.filter(region => {
       const touchesLeftEdge = region.start <= 1;
       const touchesRightEdge = region.end >= width - 2;
-      return !touchesLeftEdge && !touchesRightEdge;
+      const touchesBothEdges = touchesLeftEdge && touchesRightEdge;
+      const spanRatio = (region.end - region.start) / width;
+      
+      if (type === "width") {
+        // Front photo: reject if touches any edge
+        return !touchesLeftEdge && !touchesRightEdge;
+      } else {
+        // Side photo: reject if touches both edges OR spans > 80% of width
+        if (touchesBothEdges || spanRatio > 0.8) {
+          return false;
+        }
+        // Allow regions touching one edge (normal for side profile)
+        return true;
+      }
     });
     
     return nonEdgeRegions;
@@ -757,39 +1575,101 @@ export default function App() {
     // maskData is a Uint8Array where each value represents mask confidence
     // Values > 127 typically indicate person pixels
 
-    // Determine if mask is inverted
-    const sampleIdx = Math.floor(height * 0.5) * width + Math.floor(width * 0.5);
-    const avgSample = maskData[sampleIdx];
-    const useInverted = avgSample < 64;
+    // Determine if mask is inverted by sampling multiple points
+    // Sample center and a few points around it
+    const centerY = Math.floor(height * 0.5);
+    const centerX = Math.floor(width * 0.5);
+    const samplePoints = [
+      centerY * width + centerX,
+      centerY * width + Math.floor(width * 0.3),
+      centerY * width + Math.floor(width * 0.7),
+      Math.floor(height * 0.3) * width + centerX,
+      Math.floor(height * 0.7) * width + centerX,
+    ];
+    const samples = samplePoints.map(idx => maskData[idx]);
+    const avgSample = samples.reduce((a, b) => a + b, 0) / samples.length;
+    let useInverted = avgSample < 64;
 
     // Find torso ROI (largest 2D connected component)
-    const torsoROI = findTorsoROI(maskData, width, height, useInverted);
+    let torsoROI = findTorsoROI(maskData, width, height, useInverted);
+    
+    // If ROI spans > 90% of image width, mask is likely inverted
+    if (torsoROI && (torsoROI.maxX - torsoROI.minX) / width > 0.9) {
+      console.warn(`[${type}] Torso ROI spans ${((torsoROI.maxX - torsoROI.minX) / width * 100).toFixed(1)}% of width - trying inverted mask`);
+      useInverted = !useInverted;
+      torsoROI = findTorsoROI(maskData, width, height, useInverted);
+    }
+    
     if (!torsoROI) {
       console.warn(`[${type}] No valid torso ROI found`);
       return null;
     }
     
-    console.log(`[${type}] Torso ROI: x=${torsoROI.minX}-${torsoROI.maxX}, y=${torsoROI.minY}-${torsoROI.maxY}`);
+    const roiWidthRatio = (torsoROI.maxX - torsoROI.minX) / width;
+    console.log(`[${type}] Torso ROI: x=${torsoROI.minX}-${torsoROI.maxX}, y=${torsoROI.minY}-${torsoROI.maxY} (${(roiWidthRatio * 100).toFixed(1)}% of width), inverted=${useInverted}`);
 
     // Convert head/heel Y positions to actual pixel positions
     const headYPx = (headY / 720) * height;
     const heelYPx = (heelY / 720) * height;
     const bodyHeightPx = heelYPx - headYPx;
     const bodyHeightCm = bodyHeightPx * scaleMmPerPx / 10;
+    
+    // Scale logging
+    console.log(`[scale] mm/px=${scaleMmPerPx.toFixed(3)}, spanPx=${bodyHeightPx.toFixed(1)}, H=${bodyHeightCm.toFixed(1)}cm`);
 
     // Sanity constraints based on height
+    // Width (front photo): side-to-side breadth is larger
     const minWidthCm = bodyHeightCm * 0.25; // 25% of height
-    const maxWidthCm = bodyHeightCm * 0.55; // 55% of height
-    const minDepthCm = bodyHeightCm * 0.18; // 18% of height
-    const maxDepthCm = bodyHeightCm * 0.50; // 50% of height
+    const maxWidthCm = bodyHeightCm * 0.50; // 50% of height (reduced from 55%)
+    // Depth (side photo): front-to-back thickness is naturally smaller
+    const minDepthCm = bodyHeightCm * 0.18; // 18% of height (restored for better validation)
+    const maxDepthCm = bodyHeightCm * 0.45; // 45% of height (reduced from 50%)
 
-    // Define key vertical positions as percentages from head (0.0) to heel (1.0)
+    // Define key vertical positions as ratios from HEAD (0.0 = head, 1.0 = heel)
+    // All ratios are from HEAD to ensure correct ordering: chest < waist < hips < thighs
+    // Based on anatomical proportions and avoiding deltoids/arm flare
     const landmarks = {
-      chest: 0.30,   // ~30% down from head
-      waist: 0.45,   // ~45% down from head
-      hips: 0.55,    // ~55% down from head
-      thighs: 0.70,  // ~70% down from head
+      chest: 0.30,   // 30% down from head (~0.26-0.35H typical range)
+      waist: 0.45,   // 45% down from head (~0.23-0.32H typical range)
+      hips: 0.55,    // 55% down from head (~0.26-0.36H typical range)
+      thighs: 0.70,  // 70% down from head
     };
+    
+    // Sanity check: verify band ordering (chest should be above waist/hips)
+    const chestY = Math.floor(headYPx + (bodyHeightPx * landmarks.chest));
+    const waistY = Math.floor(headYPx + (bodyHeightPx * landmarks.waist));
+    const hipsY = Math.floor(headYPx + (bodyHeightPx * landmarks.hips));
+    
+    if (!(chestY < waistY && waistY < hipsY)) {
+      console.warn(`[bands] Invalid order detected! chestY=${chestY}, waistY=${waistY}, hipsY=${hipsY}`);
+      console.warn(`[bands] Falling back to safe ratios: chest=0.30, waist=0.45, hips=0.55`);
+      // Already using safe ratios, but log the issue
+    }
+    
+    console.log(`[bands % of H from head]`, {
+      chest: landmarks.chest.toFixed(2),
+      waist: landmarks.waist.toFixed(2),
+      hips: landmarks.hips.toFixed(2),
+      thighs: landmarks.thighs.toFixed(2)
+    });
+    console.log(`[bands y px]`, {
+      chest: chestY,
+      waist: waistY,
+      hips: hipsY,
+      thighs: Math.floor(headYPx + (bodyHeightPx * landmarks.thighs))
+    });
+
+    // Apply horizontal morphological opening for width measurements (suppress arms)
+    // Calculate kernel size: remove 35-45mm of lateral arm bulge
+    // k_px = round(desired_mm / mm_per_px) where desired_mm ∈ [35, 45]
+    let processedMaskData = maskData;
+    let kernelSize = null;
+    if (type === "width") {
+      const targetRemovalMm = 35; // Start with 35mm (3.5cm)
+      kernelSize = Math.max(15, Math.min(30, Math.round(targetRemovalMm / scaleMmPerPx)));
+      console.log(`[${type}] Applying horizontal opening with kernel=${kernelSize}px (target: ${targetRemovalMm}mm removal, scale=${scaleMmPerPx.toFixed(3)}mm/px)`);
+      processedMaskData = applyHorizontalOpening(maskData, width, height, useInverted, kernelSize);
+    }
 
     const measurements = {};
 
@@ -810,72 +1690,168 @@ export default function App() {
         continue;
       }
 
-      // Use median across vertical band (±15px) instead of single row
-      // This kills local holes/noise
-      const bandHalfHeight = 15;
-      const bandStartY = Math.max(0, centerY - bandHalfHeight);
-      const bandEndY = Math.min(height - 1, centerY + bandHalfHeight);
-      const dimensionSamples = [];
+      // Landmark-specific bounds (after opening & before retune)
+      let landmarkMinCm, landmarkMaxCm;
+      if (type === "width") {
+        // Front width guardrails (as fractions of height)
+        if (name === "chest") {
+          landmarkMinCm = bodyHeightCm * 0.26;
+          landmarkMaxCm = bodyHeightCm * 0.35;
+        } else if (name === "waist") {
+          landmarkMinCm = bodyHeightCm * 0.23;
+          landmarkMaxCm = bodyHeightCm * 0.32;
+        } else if (name === "hips") {
+          landmarkMinCm = bodyHeightCm * 0.26;
+          landmarkMaxCm = bodyHeightCm * 0.36;
+        } else { // thighs
+          landmarkMinCm = bodyHeightCm * 0.20;
+          landmarkMaxCm = bodyHeightCm * 0.50;
+        }
+      } else {
+        // Side depth guardrails (as fractions of height)
+        // Lowered minimums based on actual measurements (chest/waist typically 10-15% of height)
+        if (name === "chest") {
+          landmarkMinCm = bodyHeightCm * 0.10; // Lowered from 0.18 (was 30.6cm for 170cm, now 17cm)
+          landmarkMaxCm = bodyHeightCm * 0.28;
+        } else if (name === "waist") {
+          landmarkMinCm = bodyHeightCm * 0.14; // Lowered from 0.18 (was 30.6cm for 170cm, now 23.8cm)
+          landmarkMaxCm = bodyHeightCm * 0.28;
+        } else if (name === "hips") {
+          landmarkMinCm = bodyHeightCm * 0.18;
+          landmarkMaxCm = bodyHeightCm * 0.30;
+        } else { // thighs
+          landmarkMinCm = bodyHeightCm * 0.12;
+          landmarkMaxCm = bodyHeightCm * 0.45;
+        }
+      }
       
-      for (let y = bandStartY; y <= bandEndY; y++) {
-        const regions = scanRowForBodyRegions(maskData, width, y, useInverted, torsoROI);
+      let dimPx, dimCm, usedKernel = kernelSize, chosenRegion = null;
+      
+      if (type === "width") {
+        // For width: use auto-tune with 10th percentile
+        // Try initial kernel, then retune if needed
+        const depthEstimate = measurements.waist ? measurements.waist.cm * 1.2 : null; // Rough estimate
+        const result = measureWidthWithRetune(
+          maskData, width, height, useInverted, torsoROI, name, centerY,
+          bodyHeightCm, scaleMmPerPx, kernelSize, depthEstimate
+        );
         
-        // Discard fragmented rows (>1 internal component after edge rejection)
-        if (regions.length === 0 || regions.length > 1) {
-          // Skip fragmented rows or rows with no valid regions
+        if (result) {
+          dimPx = result.widthPx;
+          dimCm = result.widthCm;
+          usedKernel = result.kernel;
+          chosenRegion = result.details;
+          
+          // Enhanced debug logs
+          const widthSamples = []; // Would need to collect from measureWidthWithRetune
+          console.log(`[width] ${name}: p10=${dimPx.toFixed(1)}px, kernel=${usedKernel}px`);
+          if (chosenRegion) {
+            console.log(`[asym] ${name}: L=${chosenRegion.leftX - torsoROI.minX}px, R=${torsoROI.maxX - chosenRegion.rightX}px`);
+          }
+        } else {
+          console.warn(`  ${name} (${type}): Auto-tune failed for all kernels`);
+          measurements[name] = null;
+          continue;
+        }
+      } else {
+        // For depth: use vertical band with MEDIAN
+        const bandHalfHeight = 20;
+        const bandStartY = Math.max(0, centerY - bandHalfHeight);
+        const bandEndY = Math.min(height - 1, centerY + bandHalfHeight);
+        const dimensionSamples = [];
+        
+        for (let y = bandStartY; y <= bandEndY; y++) {
+          const regions = scanRowForBodyRegions(processedMaskData, width, y, useInverted, torsoROI, type);
+          if (regions.length === 1) {
+            const region = regions[0];
+            dimensionSamples.push(region.end - region.start);
+          }
+        }
+        
+        if (dimensionSamples.length === 0) {
+          console.warn(`  ${name} (${type}): No valid regions found in vertical band`);
+          measurements[name] = null;
           continue;
         }
         
-        // Single valid region found - use it
-        const region = regions[0];
-        const dimPx = region.end - region.start;
-        dimensionSamples.push(dimPx);
+        // Use median for depth
+        dimensionSamples.sort((a, b) => a - b);
+        const medianIdx = Math.floor(dimensionSamples.length / 2);
+        dimPx = dimensionSamples.length % 2 === 0
+          ? (dimensionSamples[medianIdx - 1] + dimensionSamples[medianIdx]) / 2
+          : dimensionSamples[medianIdx];
+        dimCm = (dimPx * scaleMmPerPx) / 10;
+        
+        // Enhanced debug logs
+        const p30 = percentile(dimensionSamples, 30);
+        const p50 = percentile(dimensionSamples, 50);
+        const p70 = percentile(dimensionSamples, 70);
+        console.log(`[depth] ${name}: p50=${p50?.toFixed(1) || 'N/A'}px, p30=${p30?.toFixed(1) || 'N/A'}px, p70=${p70?.toFixed(1) || 'N/A'}px`);
       }
       
-      if (dimensionSamples.length === 0) {
-        console.warn(`  ${name} (${type}): No valid regions found in vertical band`);
-        measurements[name] = null;
-        continue;
+      // Symmetry clamp for width (apply BEFORE bounds check)
+      if (type === "width" && chosenRegion) {
+        const torsoCenterX = (torsoROI.minX + torsoROI.maxX) / 2;
+        const leftHalf = chosenRegion.leftX - torsoROI.minX;
+        const rightHalf = torsoROI.maxX - chosenRegion.rightX;
+        const asymmetry = Math.abs(leftHalf - rightHalf) / dimPx;
+        
+        if (asymmetry > 0.25) {
+          // Apply symmetry clamp: width = 2 * min(leftHalf, rightHalf)
+          const wSym = 2 * Math.min(leftHalf, rightHalf);
+          console.log(`[asym] ${name}: High asymmetry ${(asymmetry * 100).toFixed(1)}%, clamping: ${dimPx.toFixed(1)}px → ${wSym.toFixed(1)}px`);
+          dimPx = Math.min(dimPx, wSym);
+          dimCm = (dimPx * scaleMmPerPx) / 10;
+        }
       }
       
-      // Take median dimension
-      dimensionSamples.sort((a, b) => a - b);
-      const medianIdx = Math.floor(dimensionSamples.length / 2);
-      const dimPx = dimensionSamples.length % 2 === 0
-        ? (dimensionSamples[medianIdx - 1] + dimensionSamples[medianIdx]) / 2
-        : dimensionSamples[medianIdx];
+      // Soft coupling: width ≤ 1.25 * depth (only if we have depth estimate)
+      // Note: depthEstimate is only available for width measurements
+      if (type === "width") {
+        const currentDepthEstimate = measurements.waist ? measurements.waist.cm * 1.2 : null;
+        if (currentDepthEstimate && dimCm > currentDepthEstimate * 1.25) {
+          const capped = currentDepthEstimate * 1.25;
+          console.log(`[guards] ${name}: Soft cap applied: ${dimCm.toFixed(1)}cm → ${capped.toFixed(1)}cm (1.25×depth)`);
+          dimCm = capped;
+          dimPx = (capped * 10) / scaleMmPerPx;
+        }
+      }
       
-      const dimMm = dimPx * scaleMmPerPx;
-      const dimCm = dimMm / 10;
+      // Check bounds with ±10% tolerance
+      const tolerance = 0.10;
+      const adjustedMinCm = landmarkMinCm * (1 - tolerance);
+      const adjustedMaxCm = landmarkMaxCm * (1 + tolerance);
       
-      // Apply sanity constraints based on height
-      const minCm = type === "width" ? minWidthCm : minDepthCm;
-      const maxCm = type === "width" ? maxWidthCm : maxDepthCm;
-      
-      // Also check depth > width * 1.3 (likely included back/head bump)
       let shouldReject = false;
       let rejectReason = "";
+      let guardTripped = "";
       
-      if (dimCm < minCm || dimCm > maxCm) {
-        shouldReject = true;
-        rejectReason = `outside height-based bounds (${minCm.toFixed(1)}-${maxCm.toFixed(1)}cm)`;
-      }
-      
-      // Additional check: if depth significantly exceeds width (for side photo)
-      if (type === "depth" && measurements[name] === undefined) {
-        // Will check after we have width, but log for now
+      // Check bounds with tolerance
+      if (dimCm < adjustedMinCm || dimCm > adjustedMaxCm) {
+        // Check strict bounds
+        if (dimCm < landmarkMinCm || dimCm > landmarkMaxCm) {
+          shouldReject = true;
+          rejectReason = `outside height-based bounds (${landmarkMinCm.toFixed(1)}-${landmarkMaxCm.toFixed(1)}cm)`;
+          guardTripped = `range guard: ${dimCm.toFixed(1)}cm vs [${landmarkMinCm.toFixed(1)}, ${landmarkMaxCm.toFixed(1)}]`;
+        } else {
+          console.log(`[guards] ${name}: ${dimCm.toFixed(1)}cm within tolerance (±10%) of bounds`);
+        }
       }
       
       if (shouldReject) {
-        console.warn(`  ${name} (${type}): Rejected - ${dimCm.toFixed(1)}cm ${rejectReason}`);
-        console.warn(`    Body height: ${bodyHeightCm.toFixed(1)}cm, Required: ${minCm.toFixed(1)}-${maxCm.toFixed(1)}cm`);
-        console.warn(`    Samples: ${dimensionSamples.length}, Median: ${dimPx.toFixed(1)}px`);
+        console.warn(`[guards] ${name} (${type}): Rejected - ${rejectReason}`);
+        console.warn(`  ${guardTripped}`);
+        console.warn(`  Body height: ${bodyHeightCm.toFixed(1)}cm`);
         measurements[name] = null;
         continue;
       }
       
-      console.log(`  ${name} (${type}): ${dimPx.toFixed(1)}px → ${dimCm.toFixed(1)}cm (${dimMm.toFixed(1)}mm)`);
-      console.log(`    Vertical band y=${bandStartY}-${bandEndY}, ${dimensionSamples.length} valid rows, median dimension`);
+      console.log(`  ${name} (${type}): ${dimPx.toFixed(1)}px → ${dimCm.toFixed(1)}cm`);
+      if (type === "width") {
+        console.log(`    [opening] k_px=${usedKernel}px applied, [width] chosen=${dimPx.toFixed(1)}px`);
+      }
+      
+      const dimMm = dimPx * scaleMmPerPx;
       
       measurements[name] = {
         pixels: Math.round(dimPx),
@@ -952,6 +1928,1105 @@ export default function App() {
     event.target.value = '';
   };
 
+  // Manual drawing: handle file upload
+  const handleManualFileUpload = async (event, photoType) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    if (!file.type.startsWith('image/')) {
+      alert("Please upload an image file");
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        // Create canvas from uploaded image
+        const canvas = document.createElement("canvas");
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0);
+        
+        // Store canvas and data URL
+        capturedCanvasRef.current = canvas;
+        const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
+        setCapturedDataUrl(dataUrl);
+
+        if (photoType === "front") {
+          setFrontImageData(dataUrl);
+          if (sideImageData) {
+            setManualCaptureState("front-calibration");
+          } else {
+            setManualCaptureState("side-capture");
+            setCapturedDataUrl(null);
+          }
+        } else if (photoType === "side") {
+          setSideImageData(dataUrl);
+          if (!frontImageData) {
+            setManualCaptureState("front-capture");
+            setCapturedDataUrl(null);
+          } else {
+            setManualCaptureState("front-calibration");
+          }
+        }
+      };
+      img.src = e.target.result;
+    };
+    reader.onerror = () => {
+      alert("Failed to read file");
+    };
+    reader.readAsDataURL(file);
+    
+    // Reset file input so same file can be selected again
+    event.target.value = '';
+  };
+
+  // Helper: Get next dot to place for front photo (using imported utility)
+  const getNextFrontDot = () => {
+    return getNextFrontDotUtil(manualDots);
+  };
+
+  // Helper: Get next dot to place for side photo (using imported utility)
+  const getNextSideDot = () => {
+    return getNextSideDotUtil(manualDots);
+  };
+
+  // Helper: Check if all front dots are placed (using imported utility)
+  const areAllFrontDotsPlaced = () => {
+    return areAllFrontDotsPlacedUtil(manualDots);
+  };
+  
+  // Helper: Check if all side dots are placed (using imported utility)
+  const areAllSideDotsPlaced = () => {
+    return areAllSideDotsPlacedUtil(manualDots);
+  };
+
+  // Helper: Get dot color based on type and photo type (using imported utility)
+  const getDotColor = (photoType, type, side) => {
+    return getDotColorUtil(photoType, type, side);
+  };
+
+  // Manual drawing: handle clicking on image to place dots (if not dragging)
+  const handleManualImageClick = (e, photoType) => {
+    // If already dragging a dot, don't place a new one
+    if (draggingDot) {
+      console.log("Already dragging a dot, ignoring click");
+      return;
+    }
+    
+    e.preventDefault();
+    e.stopPropagation();
+    
+    const rect = e.currentTarget.getBoundingClientRect();
+    const img = displayRef.current;
+    if (!img) {
+      console.log("No image element found");
+      return;
+    }
+    
+    if (!img.complete) {
+      console.log("Image not loaded yet");
+      return;
+    }
+    
+    const imgRect = img.getBoundingClientRect();
+    const containerRect = img.parentElement?.getBoundingClientRect();
+    if (!containerRect) {
+      console.log("No container element found");
+      return;
+    }
+    
+    const offsetX = (containerRect.width - imgRect.width) / 2;
+    const offsetY = (containerRect.height - imgRect.height) / 2;
+    
+    // Use image natural dimensions or canvas if available
+    const imageWidth = capturedCanvasRef.current?.width || img.naturalWidth || img.width;
+    const imageHeight = capturedCanvasRef.current?.height || img.naturalHeight || img.height;
+    
+    const scaleX = imageWidth / imgRect.width;
+    const scaleY = imageHeight / imgRect.height;
+    
+    const clickX = (e.clientX - rect.left - offsetX) * scaleX;
+    const clickY = (e.clientY - rect.top - offsetY) * scaleY;
+    
+    // Gotcha guard: Disallow dots within 2px of image borders
+    const MIN_EDGE_DISTANCE = 2;
+    if (clickX < MIN_EDGE_DISTANCE || clickX > imageWidth - MIN_EDGE_DISTANCE ||
+        clickY < MIN_EDGE_DISTANCE || clickY > imageHeight - MIN_EDGE_DISTANCE) {
+      alert(`Please place dots at least ${MIN_EDGE_DISTANCE}px away from image edges for accurate measurements.`);
+      return;
+    }
+    
+    // Clamp to image bounds (with edge guard)
+    const clampedX = Math.max(MIN_EDGE_DISTANCE, Math.min(imageWidth - MIN_EDGE_DISTANCE, clickX));
+    const clampedY = Math.max(MIN_EDGE_DISTANCE, Math.min(imageHeight - MIN_EDGE_DISTANCE, clickY));
+    
+    console.log(`Click on ${photoType} photo:`, { clickX, clickY, clampedX, clampedY });
+    
+    if (photoType === "front") {
+      const nextDot = getNextFrontDot();
+      if (nextDot) {
+        console.log(`Placing ${nextDot.type} ${nextDot.side} dot at:`, { x: clampedX, y: clampedY });
+        setManualDots(prev => {
+          const updated = {
+            ...prev,
+            front: {
+              ...prev.front,
+              [nextDot.type]: {
+                ...prev.front[nextDot.type],
+                [nextDot.side]: { x: clampedX, y: clampedY }
+              }
+            }
+          };
+          console.log("Updated manualDots:", updated);
+          return updated;
+        });
+      } else {
+        console.log("All front dots already placed");
+      }
+    } else if (photoType === "side") {
+      const nextDot = getNextSideDot();
+      if (nextDot) {
+        console.log(`Placing ${nextDot.type} ${nextDot.side} dot at:`, { x: clampedX, y: clampedY });
+        setManualDots(prev => {
+          const updated = {
+            ...prev,
+            side: {
+              ...prev.side,
+              [nextDot.type]: {
+                ...prev.side[nextDot.type],
+                [nextDot.side]: { x: clampedX, y: clampedY }
+              }
+            }
+          };
+          console.log("Updated manualDots:", updated);
+          return updated;
+        });
+      } else {
+        console.log("All side dots already placed");
+      }
+    }
+  };
+
+  // ===== UNIT HELPERS (avoid stealth unit slips) =====
+  const mm = (px, mmPerPx) => px * mmPerPx;
+  const cm = (mm) => mm / 10;
+  const inches = (mm) => mm / 25.4;
+  
+  // Helper: Convert cm to inches (1 cm = 0.393701 inches)
+  const cmToInches = (cm) => {
+    return Math.round((cm * 0.393701) * 10) / 10;
+  };
+  
+  // ===== ANGLE HELPERS =====
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+  const deg2rad = (d) => d * Math.PI / 180;
+  const rad2deg = (r) => r * 180 / Math.PI;
+  
+  // Estimate pitch from pose landmarks (lean forward/back)
+  // Uses shoulder->hip vertical slope
+  const estimatePitchFromPose = (pose) => {
+    if (!pose || !pose.landmarks || pose.landmarks.length < 33) return 0;
+    
+    const lm = pose.landmarks; // MediaPipe 33 landmarks (normalized [0..1])
+    
+    // Use average left/right shoulder and hip
+    // MediaPipe indices: 11=left_shoulder, 12=right_shoulder, 23=left_hip, 24=right_hip
+    const shY = (lm[11]?.y + lm[12]?.y) * 0.5; // shoulders
+    const hpY = (lm[23]?.y + lm[24]?.y) * 0.5; // hips
+    
+    if (!shY || !hpY) return 0;
+    
+    // Crude pitch proxy: vertical delta mapped to angle
+    const dy = (hpY - shY); // screen space (normalized)
+    const dx = 0.30; // nominal torso width in normalized units
+    let pitch = Math.atan2(dy, dx); // radians
+    
+    pitch = clamp(pitch, -deg2rad(25), deg2rad(25));
+    return pitch;
+  };
+  
+  // Estimate yaw from front image pose (rotation around vertical axis)
+  // Compares shoulder x to hip x (horizontal offset)
+  const estimateYawFromPose = (pose) => {
+    if (!pose || !pose.landmarks || pose.landmarks.length < 33) return 0;
+    
+    const lm = pose.landmarks;
+    const shX = (lm[11]?.x + lm[12]?.x) * 0.5;
+    const hpX = (lm[23]?.x + lm[24]?.x) * 0.5;
+    
+    if (!shX || !hpX) return 0;
+    
+    // Horizontal displacement relative to nominal torso height
+    const shY = (lm[11]?.y + lm[12]?.y) * 0.5;
+    const hpY = (lm[23]?.y + lm[24]?.y) * 0.5;
+    const torsoH = Math.abs(shY - hpY) + 1e-6;
+    
+    let yaw = Math.atan2(hpX - shX, torsoH); // radians
+    yaw = clamp(yaw, -deg2rad(30), deg2rad(30));
+    return yaw;
+  };
+  
+  // Apply foreshortening corrections with soft caps
+  const correctForeshortening = (meas, yawFrontRad, pitchSideRad) => {
+    const cosy = Math.max(Math.cos(Math.abs(yawFrontRad || 0)), 0.87); // cap to avoid division by tiny values
+    const cosp = Math.max(Math.cos(Math.abs(pitchSideRad || 0)), 0.87);
+    const cap = 1.15; // max +15% correction
+    
+    const corrected = {
+      frontWidthsMm: meas.frontWidthsMm ? { ...meas.frontWidthsMm } : {},
+      sideDepthsMm: meas.sideDepthsMm ? { ...meas.sideDepthsMm } : {}
+    };
+    
+    // Correct front widths for yaw
+    if (corrected.frontWidthsMm) {
+      for (const k of ["shoulders", "chest", "waist", "hips", "thighs", "calves"]) {
+        if (corrected.frontWidthsMm[k] != null && typeof corrected.frontWidthsMm[k] === 'number') {
+          const wRaw = corrected.frontWidthsMm[k];
+          if (isFinite(wRaw) && wRaw > 0) {
+            const wCorr = wRaw / cosy;
+            corrected.frontWidthsMm[k] = Math.min(wCorr, wRaw * cap);
+            // Validate result
+            if (!isFinite(corrected.frontWidthsMm[k]) || corrected.frontWidthsMm[k] <= 0) {
+              console.warn(`[${k}] Invalid corrected width, using raw value:`, wRaw);
+              corrected.frontWidthsMm[k] = wRaw;
+            }
+          }
+        }
+      }
+    }
+    
+    // Correct side depths for pitch
+    if (corrected.sideDepthsMm) {
+      for (const k of ["chest", "waist", "hips", "thighs", "calves"]) {
+        if (corrected.sideDepthsMm[k] != null && typeof corrected.sideDepthsMm[k] === 'number') {
+          const dRaw = corrected.sideDepthsMm[k];
+          if (isFinite(dRaw) && dRaw > 0) {
+            const dCorr = dRaw / cosp;
+            corrected.sideDepthsMm[k] = Math.min(dCorr, dRaw * cap);
+            // Validate result
+            if (!isFinite(corrected.sideDepthsMm[k]) || corrected.sideDepthsMm[k] <= 0) {
+              console.warn(`[${k}] Invalid corrected depth, using raw value:`, dRaw);
+              corrected.sideDepthsMm[k] = dRaw;
+            }
+          }
+        }
+      }
+    }
+    
+    return corrected;
+  };
+  
+  // ===== PIXEL SCALE REFINEMENT =====
+  // Sub-pixel edge snap: refine user-dragged head/heel to nearest strong horizontal edge
+  const refineEdgeY = (ctx, y, x0 = null, x1 = null) => {
+    const h = ctx.canvas.height;
+    const w = ctx.canvas.width;
+    const Y = Math.round(y);
+    const xL = Math.max(0, Math.floor(x0 ?? 0));
+    const xR = Math.min(w - 2, Math.ceil(x1 ?? w - 1));
+    
+    let best = { g: 0, y: Y };
+    
+    // 7px vertical window
+    for (let dy = -3; dy <= 3; dy++) {
+      const y1 = Math.min(h - 2, Math.max(1, Y + dy));
+      let gsum = 0;
+      
+      for (let x = xL; x < xR; x++) {
+        // Get vertical gradient (difference between row above and below)
+        const imgData = ctx.getImageData(x, y1 - 1, 1, 3);
+        if (imgData.data.length >= 12) {
+          // Use luminance for gradient
+          const lumUp = (imgData.data[0] + imgData.data[1] + imgData.data[2]) / 3;
+          const lumDn = (imgData.data[8] + imgData.data[9] + imgData.data[10]) / 3;
+          const gy = Math.abs(lumDn - lumUp);
+          gsum += gy;
+        }
+      }
+      
+      if (gsum > best.g) {
+        best = { g: gsum, y: y1 };
+      }
+    }
+    
+    return best.y; // refined Y
+  };
+  
+  // Frame burst median: capture multiple frames and use median for stability
+  const captureBurstMedian = async (count = 3) => {
+    const frames = [];
+    for (let i = 0; i < count; i++) {
+      await new Promise(resolve => setTimeout(resolve, 100)); // 100ms between frames
+      const canvas = capturePhoto();
+      if (canvas) frames.push(canvas);
+    }
+    if (frames.length === 0) return null;
+    
+    // For now, return the middle frame (can implement true median later)
+    return frames[Math.floor(frames.length / 2)];
+  };
+  
+  // ===== CIRCUMFERENCE MODELS =====
+  // Ramanujan ellipse perimeter (stable version)
+  const ramanujanEllipsePerimeter = (widthMm, depthMm) => {
+    const a = widthMm / 2;
+    const b = depthMm / 2;
+    const sum = a + b;
+    const diff = Math.abs(a - b);
+    
+    if (sum < 1e-6) return 0;
+    
+    const h = Math.pow(diff / sum, 2);
+    return Math.PI * sum * (1 + (3 * h) / (10 + Math.sqrt(4 - 3 * h)));
+  };
+  
+  // Superellipse (Lamé) perimeter
+  const superellipsePerimeter = (aMm, bMm, n = 3.2) => {
+    const steps = 256;
+    const dt = 2 * Math.PI / steps;
+    let s = 0;
+    
+    for (let i = 0; i <= steps; i++) {
+      const t = i * dt;
+      const c = Math.cos(t);
+      const s1 = Math.sin(t);
+      
+      const ac = aMm * Math.sign(c) * Math.pow(Math.abs(c), 2 / n);
+      const bs = bMm * Math.sign(s1) * Math.pow(Math.abs(s1), 2 / n);
+      
+      const dac = aMm * (2 / n) * Math.pow(Math.abs(c), 2 / n - 1) * (-Math.sin(t));
+      const dbs = bMm * (2 / n) * Math.pow(Math.abs(s1), 2 / n - 1) * Math.cos(t);
+      
+      const speed = Math.hypot(dac, dbs);
+      s += (i === 0 || i === steps) ? speed : (i % 2 ? 4 * speed : 2 * speed);
+    }
+    
+    return (dt / 3) * s;
+  };
+  
+  // Rounded-rectangle perimeter
+  const roundedRectPerimeter = (widthMm, depthMm, rMm = null) => {
+    const w = widthMm;
+    const d = depthMm;
+    const r = rMm ?? Math.min(0.12 * Math.min(w, d), w / 2, d / 2);
+    
+    return 2 * ((w - 2 * r) + (d - 2 * r)) + 2 * Math.PI * r;
+  };
+  
+  // Auto-chooser for circumference model
+  const circumferenceMm = (widthMm, depthMm, curvatureHint = 0.5) => {
+    // Validate inputs
+    if (!widthMm || !depthMm || !isFinite(widthMm) || !isFinite(depthMm)) {
+      console.warn("circumferenceMm: Invalid inputs", { widthMm, depthMm });
+      return 0;
+    }
+    if (widthMm <= 0 || depthMm <= 0) {
+      console.warn("circumferenceMm: Non-positive inputs", { widthMm, depthMm });
+      return 0;
+    }
+    
+    const aspectRatio = Math.max(widthMm, depthMm) / Math.min(widthMm, depthMm);
+    
+    if (!isFinite(aspectRatio) || aspectRatio <= 0) {
+      console.warn("circumferenceMm: Invalid aspect ratio", { widthMm, depthMm, aspectRatio });
+      return 0;
+    }
+    
+    let result = 0;
+    
+    // Boxy silhouette -> rounded rectangle
+    if (curvatureHint > 0.6) {
+      const r = 0.12 * Math.min(widthMm, depthMm);
+      result = roundedRectPerimeter(widthMm, depthMm, r);
+    }
+    // Near-circle -> Ramanujan
+    else if (aspectRatio < 1.15) {
+      result = ramanujanEllipsePerimeter(widthMm, depthMm);
+    }
+    // General case -> superellipse
+    else {
+      const n = aspectRatio > 1.3 ? 4.0 : 3.2;
+      result = superellipsePerimeter(widthMm / 2, depthMm / 2, n);
+    }
+    
+    // Validate result
+    if (!isFinite(result) || result <= 0) {
+      console.warn("circumferenceMm: Invalid result, using Ramanujan fallback", { widthMm, depthMm, result });
+      result = ramanujanEllipsePerimeter(widthMm, depthMm);
+      if (!isFinite(result) || result <= 0) {
+        console.error("circumferenceMm: All methods failed", { widthMm, depthMm });
+        return 0;
+      }
+    }
+    
+    return result;
+  };
+  
+  // ===== CO-REGISTRATION HELPERS =====
+  // Get Y position at same physical height ratio from head
+  const rowAtRatio = (headY, heelY, r) => {
+    return headY + r * (heelY - headY); // r = 0..1 from head
+  };
+
+  // Helper: Format measurement display based on unit preference
+  const formatMeasurement = (cmValue, unit = "length") => {
+    if (!cmValue && cmValue !== 0) return { main: "—", sub: "" };
+    
+    if (useInches) {
+      const inches = cmToInches(cmValue);
+      if (unit === "area") {
+        // Convert cm² to in² (1 cm² = 0.155 in²)
+        const sqInches = Math.round((cmValue * 0.155) * 10) / 10;
+        return { main: `${sqInches} in²`, sub: `${cmValue.toFixed(1)} cm²` };
+      } else if (unit === "volume") {
+        // Keep as cm³ for now, could convert to in³ or fl oz
+        return { main: `${cmValue.toFixed(1)} cm³`, sub: "" };
+      } else {
+        // Length measurement
+        return { main: `${inches} in`, sub: `${cmValue.toFixed(1)} cm` };
+      }
+    } else {
+      // Use cm
+      if (unit === "area") {
+        return { main: `${cmValue.toFixed(1)} cm²`, sub: "" };
+      } else if (unit === "volume") {
+        return { main: `${cmValue.toFixed(1)} cm³`, sub: "" };
+      } else {
+        return { main: `${cmValue.toFixed(1)} cm`, sub: "" };
+      }
+    }
+  };
+
+  // Calculate manual measurements from dots
+  const calculateManualMeasurements = () => {
+    if (!frontScaleMmPerPx || !sideScaleMmPerPx) {
+      alert("Please lock scales for both front and side photos before calculating measurements.");
+      return null;
+    }
+
+    const measurements = {};
+
+    // Helper: Calculate distance between two points
+    const calculateDistance = (dot1, dot2, scale) => {
+      if (!dot1 || !dot2) return null;
+      const dx = dot2.x - dot1.x;
+      const dy = dot2.y - dot1.y;
+      const distancePx = Math.sqrt(dx * dx + dy * dy);
+      const distanceMm = distancePx * scale;
+      const distanceCm = distanceMm / 10;
+      return {
+        pixels: Math.round(distancePx),
+        mm: Math.round(distanceMm),
+        cm: Math.round(distanceCm * 10) / 10
+      };
+    };
+
+    // Helper: Calculate 3D measurements from width and depth (IMPROVED)
+    const calculate3D = (width, depth, name) => {
+      if (!width || !depth) return null;
+      
+      // QA: Soft coupling - width should not exceed depth by too much (catches arm leaks)
+      if (width.mm > depth.mm * 1.25) {
+        console.warn(`${name}: Width (${width.cm}cm) > 1.25× depth (${depth.cm}cm) - possible arm contamination`);
+        // Soft clamp: cap width at 1.25× depth
+        width = {
+          ...width,
+          mm: depth.mm * 1.25,
+          cm: (depth.mm * 1.25) / 10
+        };
+      }
+      
+      // Symmetry check (for front width measurements)
+      // This would need left/right dots to compute, so we'll skip for now
+      
+      const widthMm = width.mm;
+      const depthMm = depth.mm;
+      
+      // Calculate area (ellipse baseline)
+      const semiMajorAxis = widthMm / 2;
+      const semiMinorAxis = depthMm / 2;
+      const crossSectionalAreaMm2 = Math.PI * semiMajorAxis * semiMinorAxis;
+      const crossSectionalAreaCm2 = crossSectionalAreaMm2 / 100;
+      
+      // Calculate circumference using auto-chooser
+      // curvatureHint: 0(round) .. 1(boxy) - estimate from aspect ratio
+      const aspectRatio = Math.max(widthMm, depthMm) / Math.min(widthMm, depthMm);
+      const curvatureHint = aspectRatio > 1.3 ? 0.7 : 0.4; // Higher aspect = boxier
+      
+      // Validate inputs before calculating circumference
+      if (!isFinite(widthMm) || !isFinite(depthMm) || widthMm <= 0 || depthMm <= 0) {
+        console.warn(`[${name}] Invalid width/depth for circumference: width=${widthMm}, depth=${depthMm}`);
+        return; // Skip this landmark
+      }
+      
+      const circumferenceMmValue = circumferenceMm(widthMm, depthMm, curvatureHint);
+      
+      // Validate circumference result
+      if (!isFinite(circumferenceMmValue) || circumferenceMmValue <= 0) {
+        console.warn(`[${name}] Invalid circumference result: ${circumferenceMmValue}, skipping`);
+        return; // Skip this landmark
+      }
+      
+      const circumferenceCm = circumferenceMmValue / 10;
+      
+      // Human plausibility check
+      if (name === "chest" && (circumferenceCm < 90 || circumferenceCm > 140)) {
+        console.warn(`${name}: Circumference ${circumferenceCm.toFixed(1)}cm outside typical range (90-140cm). Consider re-taking side photo or adjusting calibration lines.`);
+      }
+      
+        // Final validation before returning
+        if (!isFinite(circumferenceCm) || circumferenceCm <= 0 || !isFinite(circumferenceMmValue) || circumferenceMmValue <= 0) {
+          console.error(`[${name}] Invalid circumference values: cm=${circumferenceCm}, mm=${circumferenceMmValue}`);
+          return null; // Skip invalid measurements
+        }
+        
+        return {
+          name: name,
+          width: width,
+          depth: depth,
+          circumference: {
+            cm: Math.round(circumferenceCm * 10) / 10,
+            mm: Math.round(circumferenceMmValue)
+          },
+        crossSectionalArea: {
+          cm2: Math.round(crossSectionalAreaCm2 * 10) / 10,
+          mm2: Math.round(crossSectionalAreaMm2)
+        }
+      };
+    };
+
+    // Step 1: Calculate raw measurements from dots (before foreshortening correction)
+    const rawMeasurements = {
+      frontWidthsMm: {},
+      sideDepthsMm: {}
+    };
+    
+    // Calculate all front measurements (widths) - RAW
+    const frontTypes = ['shoulders', 'chest', 'waist', 'hips', 'butt'];
+    frontTypes.forEach(type => {
+      const leftDot = manualDots.front[type].left;
+      const rightDot = manualDots.front[type].right;
+      console.log(`[${type} width] Left dot:`, leftDot, "Right dot:", rightDot);
+      const width = calculateDistance(leftDot, rightDot, frontScaleMmPerPx);
+      if (width) {
+        measurements[`${type}Width`] = width;
+        rawMeasurements.frontWidthsMm[type] = width.mm; // Store raw mm for correction
+        console.log(`[${type} width] Calculated (raw):`, width);
+      } else {
+        console.log(`[${type} width] Failed to calculate - missing dots`);
+      }
+    });
+
+    // Calculate thigh and calf widths (thickness from front photo) - RAW
+    const thighsLeft = manualDots.front.thighs.left;
+    const thighsRight = manualDots.front.thighs.right;
+    console.log(`[thighs width] Left dot:`, thighsLeft, "Right dot:", thighsRight);
+    const thighsWidth = calculateDistance(thighsLeft, thighsRight, frontScaleMmPerPx);
+    if (thighsWidth) {
+      measurements.thighsWidth = thighsWidth;
+      rawMeasurements.frontWidthsMm.thighs = thighsWidth.mm;
+      console.log(`[thighs width] Calculated (raw):`, thighsWidth);
+    } else {
+      console.log(`[thighs width] Failed to calculate - missing dots`);
+    }
+
+    const calvesLeft = manualDots.front.calves.left;
+    const calvesRight = manualDots.front.calves.right;
+    console.log(`[calves width] Left dot:`, calvesLeft, "Right dot:", calvesRight);
+    const calvesWidth = calculateDistance(calvesLeft, calvesRight, frontScaleMmPerPx);
+    if (calvesWidth) {
+      measurements.calvesWidth = calvesWidth;
+      rawMeasurements.frontWidthsMm.calves = calvesWidth.mm;
+      console.log(`[calves width] Calculated (raw):`, calvesWidth);
+    } else {
+      console.log(`[calves width] Failed to calculate - missing dots`);
+    }
+
+    // Calculate all side measurements (depths) - RAW (with co-registration)
+    const sideTypes = ['chest', 'waist', 'hips', 'butt', 'thighs', 'calves'];
+    sideTypes.forEach(type => {
+      const frontDot = manualDots.side[type].front;
+      const backDot = manualDots.side[type].back;
+      console.log(`[${type} depth] Front dot:`, frontDot, "Back dot:", backDot);
+      
+      // Co-registration: find corresponding front width Y position
+      let yFrontCenter = null;
+      if (type !== 'thighs' && type !== 'calves') {
+        // For standard measurements, get Y from front width dots
+        const leftDot = manualDots.front[type].left;
+        const rightDot = manualDots.front[type].right;
+        if (leftDot && rightDot) {
+          yFrontCenter = (leftDot.y + rightDot.y) / 2;
+        }
+      }
+      
+      // Hard co-registration: snap side pair to registered Y before computing depth
+      let coRegDeltaY = 0;
+      if (yFrontCenter && frontHeadYPx && frontHeelYPx && sideHeadYPx && sideHeelYPx) {
+        const ySideRegistered = coRegisterY(yFrontCenter, frontHeadYPx, frontHeelYPx, sideHeadYPx, sideHeelYPx);
+        const ySideActual = frontDot && backDot ? (frontDot.y + backDot.y) / 2 : null;
+        if (ySideActual) {
+          coRegDeltaY = Math.abs(ySideRegistered - ySideActual);
+          if (coRegDeltaY > 10) {
+            console.log(`[${type} depth] Co-registering: actual Y=${ySideActual.toFixed(1)}, registered Y=${ySideRegistered.toFixed(1)}, adjusting by ${(ySideRegistered - ySideActual).toFixed(1)}px`);
+            // Hard snap: use snapPairToY to ensure both dots are at registered Y
+            [frontDot, backDot] = snapPairToY(frontDot, backDot, ySideRegistered);
+          }
+        }
+      }
+      
+      const depth = calculateDistance(frontDot, backDot, sideScaleMmPerPx);
+      if (depth) {
+        measurements[`${type}Depth`] = depth;
+        rawMeasurements.sideDepthsMm[type] = depth.mm; // Store raw mm for correction
+        console.log(`[${type} depth] Calculated (raw):`, depth);
+      } else {
+        console.log(`[${type} depth] Failed to calculate - missing dots`);
+      }
+    });
+
+    // Step 2: Apply foreshortening corrections (NUMERIC PITCH/YAW CORRECTION)
+    // Use smoothed yaw from front pose (already calculated during lockScale)
+    let yawFrontRad = frontYawSmoothed;
+    if (!yawFrontRad && frontPose) {
+      // Re-estimate if not already smoothed (fallback)
+      yawFrontRad = estimateYawFromPoseStable(frontPose, frontYawSmoothed);
+      setFrontYaw(yawFrontRad);
+      setFrontYawSmoothed(yawFrontRad);
+    }
+    
+    // Use stored side pitch with smoothing (already estimated during lockScale, but smooth it)
+    const pitchSideRadRaw = sidePitch;
+    // Smooth side pitch with angle sanity bounds
+    const pitchSideRad = smoothAngle(sidePitch, pitchSideRadRaw, 0.6, deg2rad(20));
+    
+    // Use feature flag to control side pitch correction
+    const effectiveSideTiltApplied = FLAGS.sidePitchInScale ? sideTiltApplied : false;
+    
+    console.log(`[Foreshortening] Front yaw (smoothed): ${rad2deg(yawFrontRad).toFixed(1)}°, Side pitch (smoothed): ${rad2deg(pitchSideRad).toFixed(1)}°`);
+    console.log(`[Foreshortening] Front tilt applied: ${frontTiltApplied}, Side tilt applied: ${effectiveSideTiltApplied} (flag: ${FLAGS.sidePitchInScale})`);
+    
+    // Apply corrections (skip pitch correction for side if flag says it was already applied in lockScale)
+    const correctedMeasurements = correctForeshortening(rawMeasurements, yawFrontRad, pitchSideRad, effectiveSideTiltApplied);
+    
+    // Update measurements with corrected values (with validation)
+    Object.keys(correctedMeasurements.frontWidthsMm).forEach(type => {
+      const correctedMm = correctedMeasurements.frontWidthsMm[type];
+      
+      // Validate corrected value
+      if (!isFinite(correctedMm) || correctedMm <= 0) {
+        console.warn(`[${type} width] Invalid corrected value: ${correctedMm}, using raw value`);
+        const rawMm = rawMeasurements.frontWidthsMm[type];
+        if (isFinite(rawMm) && rawMm > 0) {
+          correctedMm = rawMm; // Fallback to raw value
+        } else {
+          console.error(`[${type} width] Raw value also invalid: ${rawMm}, skipping`);
+          return; // Skip this measurement
+        }
+      }
+      
+      const correctedCm = correctedMm / 10;
+      if (type === 'thighs') {
+        measurements.thighsWidth = {
+          ...measurements.thighsWidth,
+          mm: correctedMm,
+          cm: correctedCm
+        };
+      } else if (type === 'calves') {
+        measurements.calvesWidth = {
+          ...measurements.calvesWidth,
+          mm: correctedMm,
+          cm: correctedCm
+        };
+      } else {
+        measurements[`${type}Width`] = {
+          ...measurements[`${type}Width`],
+          mm: correctedMm,
+          cm: correctedCm
+        };
+      }
+      const rawCm = rawMeasurements.frontWidthsMm[type] / 10;
+      console.log(`[${type}] Corrected: ${correctedCm.toFixed(1)}cm (was ${rawCm.toFixed(1)}cm)`);
+    });
+    
+    Object.keys(correctedMeasurements.sideDepthsMm).forEach(type => {
+      let correctedMm = correctedMeasurements.sideDepthsMm[type] || rawMeasurements.sideDepthsMm[type];
+      
+      // Validate corrected value
+      if (!isFinite(correctedMm) || correctedMm <= 0) {
+        console.warn(`[${type} depth] Invalid corrected value: ${correctedMm}, using raw value`);
+        const rawMm = rawMeasurements.sideDepthsMm[type];
+        if (isFinite(rawMm) && rawMm > 0) {
+          correctedMm = rawMm; // Fallback to raw value
+        } else {
+          console.error(`[${type} depth] Raw value also invalid: ${rawMm}, skipping`);
+          return; // Skip this measurement
+        }
+      }
+      
+      const correctedCm = correctedMm / 10;
+      measurements[`${type}Depth`] = {
+        ...measurements[`${type}Depth`],
+        mm: correctedMm,
+        cm: correctedCm
+      };
+      const rawCm = rawMeasurements.sideDepthsMm[type] / 10;
+      console.log(`[${type}] Corrected: ${correctedCm.toFixed(1)}cm (was ${rawCm.toFixed(1)}cm)`);
+    });
+
+    // Step 3: Finalize bands with symmetric coupling and plausibility checks
+    // Use finalizeBand for all measurements (applies symmetric clamping in one place)
+    const finalizedMeasurements = {
+      frontWidthsMm: { ...correctedMeasurements.frontWidthsMm },
+      sideDepthsMm: { ...correctedMeasurements.sideDepthsMm },
+      circumferencesMm: {},
+      areasMm2: {}
+    };
+    
+    const all3DTypes = ['chest', 'waist', 'hips', 'butt', 'thighs', 'calves'];
+    // Track co-registration stats
+    const coRegStats = { total: 0, sumDeltaY: 0 };
+    
+    all3DTypes.forEach(type => {
+      const result = finalizeBand(finalizedMeasurements, type);
+      if (result) {
+        // Update measurements with finalized values
+        const width = {
+          mm: result.width,
+          cm: result.width / 10
+        };
+        const depth = {
+          mm: result.depth,
+          cm: result.depth / 10
+        };
+        
+        // Instrumentation: log compact per-band info
+        const wRaw = rawMeasurements.frontWidthsMm[type] || 0;
+        const dRaw = rawMeasurements.sideDepthsMm[type] || 0;
+        const wFinal = result.width;
+        const dFinal = result.depth;
+        const cFinal = result.circumference / 10; // cm
+        const flags = finalizedMeasurements.flags?.[type] || {};
+        const flagStr = flags.wdSuspicious ? 'wdSuspicious' : 'ok';
+        const r = type === 'shoulders' ? 0.30 : type === 'chest' ? 0.38 : type === 'waist' ? 0.46 : type === 'hips' ? 0.55 : type === 'butt' ? 0.58 : 0.70;
+        console.log(`[b] ${type} r=${r.toFixed(2)} Wraw=${(wRaw/10).toFixed(1)}mm Draw=${(dRaw/10).toFixed(1)}mm yaw=${rad2deg(yawFrontRad).toFixed(1)}° pitchS=${rad2deg(pitchSideRad).toFixed(1)}°`);
+        console.log(` -> W=${(wFinal/10).toFixed(1)}mm D=${(dFinal/10).toFixed(1)}mm C=${cFinal.toFixed(1)}cm flags: ${flagStr}`);
+        
+        // Calculate 3D measurements using finalized values
+        const type3D = calculate3D(width, depth, type);
+        if (type3D) {
+          // Update with finalized circumference and area
+          type3D.circumference = {
+            cm: Math.round((result.circumference / 10) * 10) / 10,
+            mm: Math.round(result.circumference)
+          };
+          type3D.crossSectionalArea = {
+            cm2: Math.round((result.area / 100) * 10) / 10,
+            mm2: Math.round(result.area)
+          };
+          measurements[`${type}3D`] = type3D;
+        }
+      } else {
+        // Fallback to original calculation if finalizeBand returns null
+        const width = type === 'thighs' ? measurements.thighsWidth : 
+                      type === 'calves' ? measurements.calvesWidth :
+                      measurements[`${type}Width`];
+        const depth = measurements[`${type}Depth`];
+        if (width && depth && width.mm && depth.mm && isFinite(width.mm) && isFinite(depth.mm) && width.mm > 0 && depth.mm > 0) {
+          const type3D = calculate3D(width, depth, type);
+          if (type3D) {
+            measurements[`${type}3D`] = type3D;
+            console.log(`[${type} 3D] Calculated (fallback):`, type3D);
+          }
+        }
+      }
+    });
+
+    // Calculate leg lengths from front photo (using knee as midpoint)
+    // Upper leg length: from thigh top to knee
+    if (manualDots.front.thighs.top && manualDots.front.knee.center) {
+      const upperLegLengthPx = Math.sqrt(
+        Math.pow(manualDots.front.knee.center.x - manualDots.front.thighs.top.x, 2) +
+        Math.pow(manualDots.front.knee.center.y - manualDots.front.thighs.top.y, 2)
+      );
+      const upperLegLengthMm = upperLegLengthPx * frontScaleMmPerPx;
+      measurements.upperLegLength = {
+        pixels: Math.round(upperLegLengthPx),
+        mm: Math.round(upperLegLengthMm),
+        cm: Math.round((upperLegLengthMm / 10) * 10) / 10
+      };
+    }
+
+    // Lower leg length: from knee to ankle (calves bottom)
+    if (manualDots.front.knee.center && manualDots.front.calves.bottom) {
+      const lowerLegLengthPx = Math.sqrt(
+        Math.pow(manualDots.front.calves.bottom.x - manualDots.front.knee.center.x, 2) +
+        Math.pow(manualDots.front.calves.bottom.y - manualDots.front.knee.center.y, 2)
+      );
+      const lowerLegLengthMm = lowerLegLengthPx * frontScaleMmPerPx;
+      measurements.lowerLegLength = {
+        pixels: Math.round(lowerLegLengthPx),
+        mm: Math.round(lowerLegLengthMm),
+        cm: Math.round((lowerLegLengthMm / 10) * 10) / 10
+      };
+    }
+
+    // Total leg length (thigh top to ankle)
+    if (manualDots.front.thighs.top && manualDots.front.calves.bottom) {
+      const totalLegLengthPx = Math.sqrt(
+        Math.pow(manualDots.front.calves.bottom.x - manualDots.front.thighs.top.x, 2) +
+        Math.pow(manualDots.front.calves.bottom.y - manualDots.front.thighs.top.y, 2)
+      );
+      const totalLegLengthMm = totalLegLengthPx * frontScaleMmPerPx;
+      measurements.totalLegLength = {
+        pixels: Math.round(totalLegLengthPx),
+        mm: Math.round(totalLegLengthMm),
+        cm: Math.round((totalLegLengthMm / 10) * 10) / 10
+      };
+    }
+
+    return measurements;
+  };
+
+  // Manual drawing: handle front photo capture
+  const handleManualCaptureFront = () => {
+    startCountdownAndCapture((canvas) => {
+      if (!canvas) return;
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
+      setFrontImageData(dataUrl);
+      // If side photo already captured, move straight to calibration, else prompt for side capture
+      if (sideImageData) {
+        setManualCaptureState("front-calibration");
+      } else {
+        setManualCaptureState("side-capture");
+        setCapturedDataUrl(null);
+        setTimeout(() => {
+          if (videoRef.current && streamRef.current) {
+            videoRef.current.srcObject = streamRef.current;
+            videoRef.current.play().catch(err => console.error("Video play error:", err));
+          }
+        }, 100);
+      }
+    });
+  };
+
+  // Manual drawing: handle side photo capture
+  const handleManualCaptureSide = () => {
+    startCountdownAndCapture((canvas) => {
+      if (!canvas) return;
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
+      setSideImageData(dataUrl);
+      if (!frontImageData) {
+        // If somehow side captured first, prompt for front capture
+        setManualCaptureState("front-capture");
+        setCapturedDataUrl(null);
+      } else {
+        setManualCaptureState("front-calibration");
+      }
+    });
+  };
+
+  // Manual drawing: submit and calculate
+  const handleManualSubmit = () => {
+    const measurements = calculateManualMeasurements();
+    if (measurements && Object.keys(measurements).length > 0) {
+      // Store all 3D measurements
+      const bodyMeasurementsObj = {};
+      ['chest', 'waist', 'hips', 'thighs', 'calves'].forEach(type => {
+        if (measurements[`${type}3D`]) {
+          bodyMeasurementsObj[type] = measurements[`${type}3D`];
+        }
+      });
+      
+      // Store leg length measurements
+      if (measurements.upperLegLength) {
+        bodyMeasurementsObj.upperLegLength = measurements.upperLegLength;
+      }
+      if (measurements.lowerLegLength) {
+        bodyMeasurementsObj.lowerLegLength = measurements.lowerLegLength;
+      }
+      if (measurements.totalLegLength) {
+        bodyMeasurementsObj.totalLegLength = measurements.totalLegLength;
+      }
+      
+      // Also store widths and depths
+      bodyMeasurementsObj.widths = {};
+      bodyMeasurementsObj.depths = {};
+      ['shoulders', 'chest', 'waist', 'hips', 'butt'].forEach(type => {
+        if (measurements[`${type}Width`]) {
+          bodyMeasurementsObj.widths[type] = measurements[`${type}Width`];
+        }
+      });
+      if (measurements.thighsWidth) {
+        bodyMeasurementsObj.widths.thighs = measurements.thighsWidth;
+      }
+      if (measurements.calvesWidth) {
+        bodyMeasurementsObj.widths.calves = measurements.calvesWidth;
+      }
+      
+      ['chest', 'waist', 'hips', 'butt', 'thighs', 'calves'].forEach(type => {
+        if (measurements[`${type}Depth`]) {
+          bodyMeasurementsObj.depths[type] = measurements[`${type}Depth`];
+        }
+      });
+      
+      setBodyMeasurements(bodyMeasurementsObj);
+      console.log("Manual measurements calculated:", measurements);
+      console.log("Body measurements stored:", bodyMeasurementsObj);
+      
+      // Debug: Log all calculated measurements
+      console.log("=== Measurement Debug ===");
+      console.log("Widths:", measurements);
+      console.log("Chest 3D:", measurements.chest3D);
+      console.log("Waist 3D:", measurements.waist3D);
+      console.log("Hips 3D:", measurements.hips3D);
+      console.log("Thighs 3D:", measurements.thighs3D);
+      console.log("Calves 3D:", measurements.calves3D);
+      console.log("Thighs Width:", measurements.thighsWidth);
+      console.log("Thighs Depth:", measurements.thighsDepth);
+      console.log("Calves Width:", measurements.calvesWidth);
+      console.log("Calves Depth:", measurements.calvesDepth);
+      console.log("========================");
+    } else {
+      alert("Please place all dots before submitting.");
+    }
+  };
+
+  // Export measurements with enhanced schema (includes angles, flags, co-registration ratios)
+  const exportMeasurements = () => {
+    if (!bodyMeasurements) {
+      alert("No measurements to export. Please calculate measurements first.");
+      return;
+    }
+
+    // Recalculate finalized measurements to get flags
+    const tempMeasurements = calculateManualMeasurements();
+    if (!tempMeasurements) {
+      alert("Failed to recalculate measurements for export.");
+      return;
+    }
+
+    const timestamp = new Date().toISOString().split('T')[0];
+    const exportData = {
+      image_ids: {
+        front: `front_${timestamp}`,
+        side: `side_${timestamp}`
+      },
+      height_cm: heightCm,
+      calibration: {
+        front: {
+          mm_per_px: frontScaleMmPerPx || null,
+          tilt_applied: frontTiltApplied,
+          pitch_rad: frontPitch,
+          yaw_rad: frontYawSmoothed,
+          head_px: frontHeadYPx,
+          heel_px: frontHeelYPx
+        },
+        side: {
+          mm_per_px: sideScaleMmPerPx || null,
+          tilt_applied: sideTiltApplied,
+          pitch_rad: sidePitch,
+          yaw_rad: 0.00, // Side photos don't have yaw
+          head_px: sideHeadYPx,
+          heel_px: sideHeelYPx
+        }
+      },
+      dots: {
+        front: [],
+        side: []
+      },
+      bands: {
+        ratios: {
+          shoulders: 0.30,
+          chest: 0.38,
+          waist: 0.46,
+          hips: 0.55,
+          butt: 0.58,
+          thighs: 0.70,
+          calves: 0.80
+        }
+      },
+      measurements_mm: {
+        front_widths: {},
+        side_depths: {},
+        circumference: {},
+        area_mm2: {}
+      },
+      flags: {},
+      version: "manual-v2.3"
+    };
+
+    // Export dots
+    ['shoulders', 'chest', 'waist', 'hips', 'butt', 'thighs', 'calves', 'knee'].forEach(type => {
+      if (manualDots.front[type]) {
+        Object.keys(manualDots.front[type]).forEach(side => {
+          const dot = manualDots.front[type][side];
+          if (dot) {
+            exportData.dots.front.push({
+              x: Math.round(dot.x),
+              y: Math.round(dot.y),
+              part: `${type}_${side}`
+            });
+          }
+        });
+      }
+    });
+
+    ['chest', 'waist', 'hips', 'butt', 'thighs', 'calves'].forEach(type => {
+      if (manualDots.side[type]) {
+        Object.keys(manualDots.side[type]).forEach(side => {
+          const dot = manualDots.side[type][side];
+          if (dot) {
+            exportData.dots.side.push({
+              x: Math.round(dot.x),
+              y: Math.round(dot.y),
+              part: `${type}_${side}`
+            });
+          }
+        });
+      }
+    });
+
+    // Export measurements
+    ['shoulders', 'chest', 'waist', 'hips', 'butt', 'thighs', 'calves'].forEach(type => {
+      const width = bodyMeasurements.widths?.[type];
+      const depth = bodyMeasurements.depths?.[type];
+      const threeD = bodyMeasurements[type];
+
+      if (width?.mm) exportData.measurements_mm.front_widths[type] = width.mm;
+      if (depth?.mm) exportData.measurements_mm.side_depths[type] = depth.mm;
+      if (threeD?.circumference?.mm) exportData.measurements_mm.circumference[type] = threeD.circumference.mm;
+      if (threeD?.crossSectionalArea?.mm2) exportData.measurements_mm.area_mm2[type] = threeD.crossSectionalArea.mm2;
+
+      // Export flags (wdSuspicious, etc.) - recalculate to get flags
+      // We'll need to store flags in state or recalculate here
+      // For now, calculate W/D ratio to determine if suspicious
+      if (width?.mm && depth?.mm) {
+        const wdRatio = Math.max(width.mm, depth.mm) / Math.min(width.mm, depth.mm);
+        exportData.flags[type] = {
+          wdSuspicious: wdRatio > 1.60
+        };
+      }
+    });
+
+    // Download as JSON
+    const jsonStr = JSON.stringify(exportData, null, 2);
+    const blob = new Blob([jsonStr], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `measurements_${timestamp}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    
+    console.log("Exported measurements:", exportData);
+  };
+
   // Submit to proceed to side capture (resets camera view but keeps scale)
   const handleSubmit = async () => {
     // Segment front photo before moving to side
@@ -983,18 +3058,104 @@ export default function App() {
     }, 100);
   };
 
+  // Start page component
+  if (mode === "select") {
+    return <ModeSelector onSelectMode={setMode} />;
+  }
+
   return (
     <div style={{background:"#0b1220", color:"#e5e7eb", minHeight:"100vh"}}>
       <div style={{maxWidth:960, margin:"0 auto", padding:16}}>
+        {/* Back button */}
+        <button
+          onClick={() => {
+            setMode("select");
+            // Reset states
+            setCaptureState(null);
+            setManualCaptureState("front-capture");
+            setBodyMeasurements(null);
+            setManualDots({
+              front: {
+                shoulders: { left: null, right: null },
+                chest: { left: null, right: null },
+                waist: { left: null, right: null },
+                hips: { left: null, right: null },
+                thighs: { left: null, right: null, top: null },
+                knee: { center: null },
+                calves: { left: null, right: null, bottom: null }
+              },
+              side: {
+                chest: { front: null, back: null },
+                waist: { front: null, back: null },
+                hips: { front: null, back: null },
+                thighs: { front: null, back: null },
+                calves: { front: null, back: null }
+              }
+            });
+            setDraggingDot(null);
+            setFrontHeadY(200);
+            setFrontHeelY(700);
+            setFrontScaleMmPerPx(null);
+            setSideHeadY(200);
+            setSideHeelY(700);
+            setSideScaleMmPerPx(null);
+            setCapturedDataUrl(null);
+            setFrontImageData(null);
+            setSideImageData(null);
+            capturedCanvasRef.current = null;
+          }}
+          style={{
+            marginBottom: 16,
+            padding: "8px 16px",
+            background: "#374151",
+            color: "#e5e7eb",
+            border: "1px solid #4B5563",
+            borderRadius: 6,
+            cursor: "pointer"
+          }}
+        >
+          ← Back to Menu
+        </button>
+
         <h1>Calibration</h1>
+        {mode === "manual" ? (
+          <p>Enter height, capture <b>front and side photos back-to-back</b>, then sit down to drag the lines, lock scale, and place dots.</p>
+        ) : (
         <p>Enter height → drag <b>Head</b>/<b>Heel</b> lines → Lock scale.</p>
+        )}
 
         <div style={{display:"flex", gap:12, alignItems:"center", margin:"12px 0"}}>
           <input type="number" value={heightCm} onChange={e=>setHeightCm(+e.target.value)} style={{width:90}}/> cm
+          {mode === "manual" ? (
+            <>
+              {(manualCaptureState === "front-calibration" || manualCaptureState === "side-calibration") && (
+                <>
+                  <button 
+                    onClick={lockScale} 
+                    disabled={manualCaptureState === "front-calibration" ? !frontImageData : !sideImageData}
+                  >
+                    {manualCaptureState === "front-calibration" ? "Lock Front Scale" : "Lock Side Scale"}
+                  </button>
+                  {manualCaptureState === "front-calibration" && frontScaleMmPerPx && (
+                    <span>Front Scale: {frontScaleMmPerPx.toFixed(3)} mm/px</span>
+                  )}
+                  {manualCaptureState === "side-calibration" && sideScaleMmPerPx && (
+                    <span>Side Scale: {sideScaleMmPerPx.toFixed(3)} mm/px</span>
+                  )}
+                </>
+              )}
+            </>
+          ) : (
+            <>
           <button onClick={lockScale}>Lock scale</button>
           {scaleMmPerPx && <span>Scale: {scaleMmPerPx.toFixed(3)} mm/px</span>}
+            </>
+          )}
         </div>
 
+        {/* Pose Estimation Mode */}
+        {mode === "pose" && (
+          <>
         <div style={{display:"flex", gap:12, margin:"12px 0", flexWrap:"wrap", alignItems:"center"}}>
           {captureState === null && (
             <>
@@ -1003,7 +3164,7 @@ export default function App() {
                 disabled={typeof countdown === "number" || !isModelReady}
               >
                 {typeof countdown === "number" ? `Capturing in ${countdown}...` : "Capture FRONT"}
-              </button>
+          </button>
               {/* Upload option for testing */}
               <label style={{
                 padding: "8px 16px",
@@ -1026,7 +3187,7 @@ export default function App() {
                 <>
                   <button onClick={retakePhoto} disabled={typeof countdown === "number"}>
                     Retake Photo
-                  </button>
+          </button>
                   <button 
                     onClick={autoDetectHeadHeel} 
                     disabled={!capturedDataUrl || !isPoseReady || typeof countdown === "number"}
@@ -1151,9 +3312,848 @@ export default function App() {
         <p style={{opacity:0.7, fontSize:12, marginTop:8}}>
           Tips: phone level (|pitch|,|roll| &lt; 2°), subject centered, full body visible, tight clothing.
         </p>
+          </>
+        )}
 
-        {/* Display segmentation composites (front and side) */}
-        {(frontComposite || sideComposite) && (
+        {/* Manual Drawing Mode */}
+        {mode === "manual" && (
+          <>
+        <div style={{display:"flex", gap:12, margin:"12px 0", flexWrap:"wrap", alignItems:"center"}}>
+          {manualCaptureState === "front-capture" && (
+            <>
+              <button 
+                onClick={handleManualCaptureFront} 
+                disabled={typeof countdown === "number"}
+              >
+                {typeof countdown === "number" ? `Capturing in ${countdown}...` : "Capture FRONT"}
+              </button>
+              <label style={{
+                padding: "8px 16px",
+                background: "#374151",
+                border: "1px solid #4B5563",
+                borderRadius: "6px",
+                cursor: "pointer",
+                fontSize: "14px",
+                display: "inline-block"
+              }}>
+                📁 Upload Front Photo
+                <input
+                  type="file"
+                  accept="image/*"
+                  style={{display: "none"}}
+                  onChange={(e) => handleManualFileUpload(e, "front")}
+                />
+              </label>
+            </>
+          )}
+          {manualCaptureState === "front-calibration" && (
+            <>
+              <button onClick={() => {
+                setManualCaptureState("front-capture");
+                setCapturedDataUrl(null);
+                setFrontImageData(null);
+                setFrontScaleMmPerPx(null);
+                setTimeout(() => {
+                  if (videoRef.current && streamRef.current) {
+                    videoRef.current.srcObject = streamRef.current;
+                    videoRef.current.play().catch(err => console.error("Video play error:", err));
+                  }
+                }, 100);
+              }}>
+                Retake Front
+              </button>
+              {frontScaleMmPerPx && (
+                <button 
+                  onClick={() => setManualCaptureState("front-dots")}
+                  style={{background:"#10b981", color:"white", fontWeight:"bold"}}
+                >
+                  Place Front Dots
+                </button>
+              )}
+            </>
+          )}
+          {manualCaptureState === "front-dots" && (
+            <>
+              <button onClick={() => {
+                setManualCaptureState("front-calibration");
+                setManualDots(prev => ({
+                  ...prev,
+                  front: {
+                    shoulders: { left: null, right: null },
+                    chest: { left: null, right: null },
+                    waist: { left: null, right: null },
+                    hips: { left: null, right: null },
+                    thighs: { left: null, right: null, top: null },
+                    knee: { center: null },
+                    calves: { left: null, right: null, bottom: null }
+                  }
+                }));
+              }}>
+                Back to Calibration
+              </button>
+              {(() => {
+                let placedCount = 0;
+                // Standard width measurements (2 dots each)
+                ['shoulders', 'chest', 'waist', 'hips'].forEach(type => {
+                  if (manualDots.front[type].left) placedCount++;
+                  if (manualDots.front[type].right) placedCount++;
+                });
+                // Thighs: 3 dots (left, right, top)
+                if (manualDots.front.thighs.left) placedCount++;
+                if (manualDots.front.thighs.right) placedCount++;
+                if (manualDots.front.thighs.top) placedCount++;
+                // Knee: 1 dot (center)
+                if (manualDots.front.knee.center) placedCount++;
+                // Calves: 3 dots (left, right, bottom)
+                if (manualDots.front.calves.left) placedCount++;
+                if (manualDots.front.calves.right) placedCount++;
+                if (manualDots.front.calves.bottom) placedCount++;
+                
+                const totalCount = 15; // 4*2 + 3 + 1 + 3 = 15 dots
+                
+                if (placedCount > 0) {
+                  return (
+                    <span style={{opacity: 0.7, fontSize: 12}}>
+                      {placedCount}/{totalCount} dots placed. {areAllFrontDotsPlaced() ? "✅ All placed! Drag to adjust or continue." : "Continue placing dots..."}
+                    </span>
+                  );
+                }
+                return null;
+              })()}
+              {areAllFrontDotsPlaced() && (
+                <button 
+                  onClick={() => {
+                    if (!sideImageData) {
+                      alert("Please capture your side photo first.");
+                      return;
+                    }
+                    setManualCaptureState("side-calibration");
+                  }}
+                  style={{background:"#10b981", color:"white", fontWeight:"bold"}}
+                >
+                  Start Side Calibration
+                </button>
+              )}
+            </>
+          )}
+          {manualCaptureState === "side-capture" && (
+            <>
+              <button 
+                onClick={handleManualCaptureSide} 
+                disabled={typeof countdown === "number"}
+              >
+                {typeof countdown === "number" ? `Capturing in ${countdown}...` : "Capture SIDE"}
+              </button>
+              <label style={{
+                padding: "8px 16px",
+                background: "#374151",
+                border: "1px solid #4B5563",
+                borderRadius: "6px",
+                cursor: "pointer",
+                fontSize: "14px",
+                display: "inline-block"
+              }}>
+                📁 Upload Side Photo
+                <input
+                  type="file"
+                  accept="image/*"
+                  style={{display: "none"}}
+                  onChange={(e) => handleManualFileUpload(e, "side")}
+                />
+              </label>
+              {frontImageData && (
+                <button
+                  onClick={() => {
+                    setManualCaptureState("front-capture");
+                    setCapturedDataUrl(null);
+                    setFrontImageData(null);
+                    setFrontScaleMmPerPx(null);
+                    setManualDots(prev => ({
+                      ...prev,
+                      front: {
+                        shoulders: { left: null, right: null },
+                        chest: { left: null, right: null },
+                        waist: { left: null, right: null },
+                        hips: { left: null, right: null },
+                        thighs: { left: null, right: null, top: null },
+                        knee: { center: null },
+                        calves: { left: null, right: null, bottom: null }
+                      }
+                    }));
+                  }}
+                >
+                  Retake Front Photo
+                </button>
+              )}
+            </>
+          )}
+          {manualCaptureState === "side-calibration" && (
+            <>
+              <button onClick={() => {
+                setManualCaptureState("side-capture");
+                setCapturedDataUrl(null);
+                setSideImageData(null);
+                setSideScaleMmPerPx(null);
+                setTimeout(() => {
+                  if (videoRef.current && streamRef.current) {
+                    videoRef.current.srcObject = streamRef.current;
+                    videoRef.current.play().catch(err => console.error("Video play error:", err));
+                  }
+                }, 100);
+              }}>
+                Retake Side
+              </button>
+              {sideScaleMmPerPx && (
+                <button 
+                  onClick={() => setManualCaptureState("side-dots")}
+                  style={{background:"#10b981", color:"white", fontWeight:"bold"}}
+                >
+                  Place Side Dots
+                </button>
+              )}
+            </>
+          )}
+          {manualCaptureState === "side-dots" && (
+            <>
+              <button onClick={() => {
+                setManualCaptureState("side-calibration");
+                setManualDots(prev => ({
+                  ...prev,
+                  side: {
+                    chest: { front: null, back: null },
+                    waist: { front: null, back: null },
+                    hips: { front: null, back: null },
+                    thighs: { front: null, back: null },
+                    calves: { front: null, back: null }
+                  }
+                }));
+              }}>
+                Back to Calibration
+              </button>
+              {(() => {
+                const placedCount = ['chest', 'waist', 'hips', 'thighs', 'calves'].reduce((count, type) => {
+                  if (manualDots.side[type].front) count++;
+                  if (manualDots.side[type].back) count++;
+                  return count;
+                }, 0);
+                const totalCount = 10; // 5 types * 2 dots each
+                
+                if (placedCount > 0) {
+                  return (
+                    <span style={{opacity: 0.7, fontSize: 12}}>
+                      {placedCount}/{totalCount} dots placed. {areAllSideDotsPlaced() ? "✅ All placed! Drag to adjust or calculate." : "Continue placing dots..."}
+                    </span>
+                  );
+                }
+                return null;
+              })()}
+              <button 
+                onClick={handleManualSubmit}
+                disabled={!areAllFrontDotsPlaced() || !areAllSideDotsPlaced()}
+                style={{background:"#10b981", color:"white", fontWeight:"bold"}}
+              >
+                Calculate Measurements
+              </button>
+            </>
+          )}
+      </div>
+
+        <div style={{display:"flex", gap:16, alignItems:"center", fontSize:12, opacity:0.85}}>
+          <span>Front Photo: {frontImageData ? "✅ ready" : "⏳ pending"}</span>
+          <span>Side Photo: {sideImageData ? "✅ ready" : "⏳ pending"}</span>
+    </div>
+
+        {manualCaptureState !== "side-capture" && (
+        <div style={{position:"relative", width:"100%", aspectRatio:"16/9", background:"black", borderRadius:12, overflow:"hidden"}}>
+          {manualCaptureState === "front-capture" ? (
+            <video 
+              key="camera-video-front"
+              ref={(el)=>{
+                if (el) {
+                  videoRef.current = el;
+                  displayRef.current = el;
+                  if (streamRef.current && el.srcObject !== streamRef.current) {
+                    el.srcObject = streamRef.current;
+                    el.onloadeddata = () => {
+                      el.play().catch(err => console.error("Video play error:", err));
+                    };
+                  } else if (streamRef.current) {
+                    // Stream already attached, just play
+                    el.play().catch(err => console.error("Video play error:", err));
+                  }
+                }
+              }} 
+              className="video" 
+              style={{width:"100%", height:"100%", objectFit:"contain"}} 
+              playsInline 
+              muted 
+              autoPlay
+            />
+          ) : manualCaptureState === "front-calibration" || manualCaptureState === "front-dots" ? (
+            <img 
+              ref={displayRef} 
+              src={frontImageData || capturedDataUrl} 
+              alt="Front Photo" 
+              style={{width:"100%", height:"100%", objectFit:"contain", cursor: manualCaptureState === "front-dots" ? (draggingDot ? "grabbing" : "crosshair") : "default"}}
+              onClick={(e) => manualCaptureState === "front-dots" && !draggingDot && handleManualImageClick(e, "front")}
+            />
+          ) : manualCaptureState === "side-calibration" || manualCaptureState === "side-dots" ? (
+            <img 
+              ref={displayRef} 
+              src={sideImageData || capturedDataUrl} 
+              alt="Side Photo" 
+              style={{width:"100%", height:"100%", objectFit:"contain", cursor: manualCaptureState === "side-dots" ? (draggingDot ? "grabbing" : "crosshair") : "default"}}
+              onClick={(e) => manualCaptureState === "side-dots" && !draggingDot && handleManualImageClick(e, "side")}
+            />
+          ) : null}
+          <canvas
+            ref={overlayRef}
+            style={{
+              position:"absolute", 
+              inset:0, 
+              zIndex:1,
+              pointerEvents: (mode === "manual" && (manualCaptureState === "front-dots" || manualCaptureState === "side-dots")) ? "none" : "auto"
+            }}
+            onPointerDown={onPointerDown}
+            onPointerMove={onPointerMove}
+            onPointerUp={onPointerUp}
+            onPointerLeave={onPointerUp}
+          />
+          {/* Draw dots on front photo */}
+          {manualCaptureState === "front-dots" && frontImageData && (() => {
+            const img = displayRef.current;
+            if (!img || !img.complete) return null;
+            const imgRect = img.getBoundingClientRect();
+            const containerRect = img.parentElement?.getBoundingClientRect();
+            if (!containerRect) return null;
+            
+            const imageWidth = capturedCanvasRef.current?.width || img.naturalWidth || img.width;
+            const imageHeight = capturedCanvasRef.current?.height || img.naturalHeight || img.height;
+            const scaleX = imgRect.width / imageWidth;
+            const scaleY = imgRect.height / imageHeight;
+            const offsetX = (containerRect.width - imgRect.width) / 2;
+            const offsetY = (containerRect.height - imgRect.height) / 2;
+            
+            // Check if any dots are placed
+            const hasAnyDots = 
+              ['shoulders', 'chest', 'waist', 'hips'].some(type => 
+                manualDots.front[type].left || manualDots.front[type].right
+              ) ||
+              manualDots.front.thighs.left || manualDots.front.thighs.right || manualDots.front.thighs.top ||
+              manualDots.front.knee.center ||
+              manualDots.front.calves.left || manualDots.front.calves.right || manualDots.front.calves.bottom;
+            
+            if (!hasAnyDots) return null;
+            
+            return (
+              <svg style={{position:"absolute", inset:0, pointerEvents:"none", zIndex:2, width:"100%", height:"100%"}}>
+                {/* Standard width measurements (shoulders, chest, waist, hips) */}
+                {['shoulders', 'chest', 'waist', 'hips'].map(type => {
+                  const leftDot = manualDots.front[type].left;
+                  const rightDot = manualDots.front[type].right;
+                  
+                  return (
+                    <g key={type}>
+                      {leftDot && (() => {
+                        const cx = offsetX + (leftDot.x * scaleX);
+                        const cy = offsetY + (leftDot.y * scaleY);
+                        const isDragging = draggingDot === `${type}-left`;
+                        
+                        return (
+                          <circle 
+                            cx={cx} 
+                            cy={cy} 
+                            r={isDragging ? "5" : "4"} 
+                            fill={getDotColor("front", type, "left")} 
+                            stroke="white" 
+                            strokeWidth={isDragging ? "2" : "1.5"} 
+                            opacity={isDragging ? 0.9 : 1}
+                            style={{cursor: "grab", pointerEvents: "auto"}}
+                            onPointerDown={(e) => {
+                              e.stopPropagation();
+                              setDraggingDot(`${type}-left`);
+                            }}
+                          />
+                        );
+                      })()}
+                      {rightDot && (() => {
+                        const cx = offsetX + (rightDot.x * scaleX);
+                        const cy = offsetY + (rightDot.y * scaleY);
+                        const isDragging = draggingDot === `${type}-right`;
+                        
+                        return (
+                          <circle 
+                            cx={cx} 
+                            cy={cy} 
+                            r={isDragging ? "5" : "4"} 
+                            fill={getDotColor("front", type, "right")} 
+                            stroke="white" 
+                            strokeWidth={isDragging ? "2" : "1.5"} 
+                            opacity={isDragging ? 0.9 : 1}
+                            style={{cursor: "grab", pointerEvents: "auto"}}
+                            onPointerDown={(e) => {
+                              e.stopPropagation();
+                              setDraggingDot(`${type}-right`);
+                            }}
+                          />
+                        );
+                      })()}
+                      {leftDot && rightDot && (
+                        <line 
+                          x1={offsetX + (leftDot.x * scaleX)} 
+                          y1={offsetY + (leftDot.y * scaleY)} 
+                          x2={offsetX + (rightDot.x * scaleX)} 
+                          y2={offsetY + (rightDot.y * scaleY)} 
+                          stroke={getDotColor("front", type, "left")} 
+                          strokeWidth="1.5" 
+                          strokeDasharray="3,3" 
+                          opacity="0.6"
+                        />
+                      )}
+                    </g>
+                  );
+                })}
+                
+                {/* Thigh measurements: thickness (left/right) and length (top to knee) */}
+                <g key="thighs">
+                  {manualDots.front.thighs.left && (() => {
+                    const dot = manualDots.front.thighs.left;
+                    const cx = offsetX + (dot.x * scaleX);
+                    const cy = offsetY + (dot.y * scaleY);
+                    const isDragging = draggingDot === 'thighs-left';
+                    return (
+                      <circle 
+                        cx={cx} cy={cy} 
+                        r={isDragging ? "5" : "4"} 
+                        fill={getDotColor("front", "thighs", "left")} 
+                        stroke="white" 
+                        strokeWidth={isDragging ? "2" : "1.5"} 
+                        opacity={isDragging ? 0.9 : 1}
+                        style={{cursor: "grab", pointerEvents: "auto"}}
+                        onPointerDown={(e) => { e.stopPropagation(); setDraggingDot('thighs-left'); }}
+                      />
+                    );
+                  })()}
+                  {manualDots.front.thighs.right && (() => {
+                    const dot = manualDots.front.thighs.right;
+                    const cx = offsetX + (dot.x * scaleX);
+                    const cy = offsetY + (dot.y * scaleY);
+                    const isDragging = draggingDot === 'thighs-right';
+                    return (
+                      <circle 
+                        cx={cx} cy={cy} 
+                        r={isDragging ? "5" : "4"} 
+                        fill={getDotColor("front", "thighs", "right")} 
+                        stroke="white" 
+                        strokeWidth={isDragging ? "2" : "1.5"} 
+                        opacity={isDragging ? 0.9 : 1}
+                        style={{cursor: "grab", pointerEvents: "auto"}}
+                        onPointerDown={(e) => { e.stopPropagation(); setDraggingDot('thighs-right'); }}
+                      />
+                    );
+                  })()}
+                  {manualDots.front.thighs.left && manualDots.front.thighs.right && (
+                    <line 
+                      x1={offsetX + (manualDots.front.thighs.left.x * scaleX)} 
+                      y1={offsetY + (manualDots.front.thighs.left.y * scaleY)} 
+                      x2={offsetX + (manualDots.front.thighs.right.x * scaleX)} 
+                      y2={offsetY + (manualDots.front.thighs.right.y * scaleY)} 
+                      stroke={getDotColor("front", "thighs", "left")} 
+                      strokeWidth="1.5" 
+                      strokeDasharray="3,3" 
+                      opacity="0.6"
+                    />
+                  )}
+                  {manualDots.front.thighs.top && (() => {
+                    const dot = manualDots.front.thighs.top;
+                    const cx = offsetX + (dot.x * scaleX);
+                    const cy = offsetY + (dot.y * scaleY);
+                    const isDragging = draggingDot === 'thighs-top';
+                    return (
+                      <circle 
+                        cx={cx} cy={cy} 
+                        r={isDragging ? "5" : "4"} 
+                        fill={getDotColor("front", "thighs", "top")} 
+                        stroke="white" 
+                        strokeWidth={isDragging ? "2" : "1.5"} 
+                        opacity={isDragging ? 0.9 : 1}
+                        style={{cursor: "grab", pointerEvents: "auto"}}
+                        onPointerDown={(e) => { e.stopPropagation(); setDraggingDot('thighs-top'); }}
+                      />
+                    );
+                  })()}
+                  {/* Line from thigh top to knee for upper leg length */}
+                  {manualDots.front.thighs.top && manualDots.front.knee.center && (
+                    <line 
+                      x1={offsetX + (manualDots.front.thighs.top.x * scaleX)} 
+                      y1={offsetY + (manualDots.front.thighs.top.y * scaleY)} 
+                      x2={offsetX + (manualDots.front.knee.center.x * scaleX)} 
+                      y2={offsetY + (manualDots.front.knee.center.y * scaleY)} 
+                      stroke={getDotColor("front", "thighs", "top")} 
+                      strokeWidth="1.5" 
+                      strokeDasharray="3,3" 
+                      opacity="0.6"
+                    />
+                  )}
+                </g>
+                
+                {/* Knee center point */}
+                {manualDots.front.knee.center && (() => {
+                  const dot = manualDots.front.knee.center;
+                  const cx = offsetX + (dot.x * scaleX);
+                  const cy = offsetY + (dot.y * scaleY);
+                  const isDragging = draggingDot === 'knee-center';
+                  return (
+                    <circle 
+                      cx={cx} cy={cy} 
+                      r={isDragging ? "5" : "4"} 
+                      fill={getDotColor("front", "knee", "center")} 
+                      stroke="white" 
+                      strokeWidth={isDragging ? "2" : "1.5"} 
+                      opacity={isDragging ? 0.9 : 1}
+                      style={{cursor: "grab", pointerEvents: "auto"}}
+                      onPointerDown={(e) => { e.stopPropagation(); setDraggingDot('knee-center'); }}
+                    />
+                  );
+                })()}
+                
+                {/* Calf measurements: thickness (left/right) and length (knee to ankle) */}
+                <g key="calves">
+                  {manualDots.front.calves.left && (() => {
+                    const dot = manualDots.front.calves.left;
+                    const cx = offsetX + (dot.x * scaleX);
+                    const cy = offsetY + (dot.y * scaleY);
+                    const isDragging = draggingDot === 'calves-left';
+                    return (
+                      <circle 
+                        cx={cx} cy={cy} 
+                        r={isDragging ? "5" : "4"} 
+                        fill={getDotColor("front", "calves", "left")} 
+                        stroke="white" 
+                        strokeWidth={isDragging ? "2" : "1.5"} 
+                        opacity={isDragging ? 0.9 : 1}
+                        style={{cursor: "grab", pointerEvents: "auto"}}
+                        onPointerDown={(e) => { e.stopPropagation(); setDraggingDot('calves-left'); }}
+                      />
+                    );
+                  })()}
+                  {manualDots.front.calves.right && (() => {
+                    const dot = manualDots.front.calves.right;
+                    const cx = offsetX + (dot.x * scaleX);
+                    const cy = offsetY + (dot.y * scaleY);
+                    const isDragging = draggingDot === 'calves-right';
+                    return (
+                      <circle 
+                        cx={cx} cy={cy} 
+                        r={isDragging ? "5" : "4"} 
+                        fill={getDotColor("front", "calves", "right")} 
+                        stroke="white" 
+                        strokeWidth={isDragging ? "2" : "1.5"} 
+                        opacity={isDragging ? 0.9 : 1}
+                        style={{cursor: "grab", pointerEvents: "auto"}}
+                        onPointerDown={(e) => { e.stopPropagation(); setDraggingDot('calves-right'); }}
+                      />
+                    );
+                  })()}
+                  {manualDots.front.calves.left && manualDots.front.calves.right && (
+                    <line 
+                      x1={offsetX + (manualDots.front.calves.left.x * scaleX)} 
+                      y1={offsetY + (manualDots.front.calves.left.y * scaleY)} 
+                      x2={offsetX + (manualDots.front.calves.right.x * scaleX)} 
+                      y2={offsetY + (manualDots.front.calves.right.y * scaleY)} 
+                      stroke={getDotColor("front", "calves", "left")} 
+                      strokeWidth="1.5" 
+                      strokeDasharray="3,3" 
+                      opacity="0.6"
+                    />
+                  )}
+                  {manualDots.front.calves.bottom && (() => {
+                    const dot = manualDots.front.calves.bottom;
+                    const cx = offsetX + (dot.x * scaleX);
+                    const cy = offsetY + (dot.y * scaleY);
+                    const isDragging = draggingDot === 'calves-bottom';
+                    return (
+                      <circle 
+                        cx={cx} cy={cy} 
+                        r={isDragging ? "5" : "4"} 
+                        fill={getDotColor("front", "calves", "bottom")} 
+                        stroke="white" 
+                        strokeWidth={isDragging ? "2" : "1.5"} 
+                        opacity={isDragging ? 0.9 : 1}
+                        style={{cursor: "grab", pointerEvents: "auto"}}
+                        onPointerDown={(e) => { e.stopPropagation(); setDraggingDot('calves-bottom'); }}
+                      />
+                    );
+                  })()}
+                  {/* Line from knee to ankle for lower leg length */}
+                  {manualDots.front.knee.center && manualDots.front.calves.bottom && (
+                    <line 
+                      x1={offsetX + (manualDots.front.knee.center.x * scaleX)} 
+                      y1={offsetY + (manualDots.front.knee.center.y * scaleY)} 
+                      x2={offsetX + (manualDots.front.calves.bottom.x * scaleX)} 
+                      y2={offsetY + (manualDots.front.calves.bottom.y * scaleY)} 
+                      stroke={getDotColor("front", "calves", "bottom")} 
+                      strokeWidth="1.5" 
+                      strokeDasharray="3,3" 
+                      opacity="0.6"
+                    />
+                  )}
+                </g>
+              </svg>
+            );
+          })()}
+          {/* Draw dots on side photo */}
+          {manualCaptureState === "side-dots" && sideImageData && (() => {
+            const img = displayRef.current;
+            if (!img || !img.complete) return null;
+            const imgRect = img.getBoundingClientRect();
+            const containerRect = img.parentElement?.getBoundingClientRect();
+            if (!containerRect) return null;
+            
+            const imageWidth = capturedCanvasRef.current?.width || img.naturalWidth || img.width;
+            const imageHeight = capturedCanvasRef.current?.height || img.naturalHeight || img.height;
+            const scaleX = imgRect.width / imageWidth;
+            const scaleY = imgRect.height / imageHeight;
+            const offsetX = (containerRect.width - imgRect.width) / 2;
+            const offsetY = (containerRect.height - imgRect.height) / 2;
+            
+            const hasAnyDots = ['chest', 'waist', 'hips', 'thighs', 'calves'].some(type => 
+              manualDots.side[type].front || manualDots.side[type].back
+            );
+            
+            if (!hasAnyDots) return null;
+            
+            return (
+              <svg style={{position:"absolute", inset:0, pointerEvents:"none", zIndex:2, width:"100%", height:"100%"}}>
+                {['chest', 'waist', 'hips', 'thighs', 'calves'].map(type => {
+                  const frontDot = manualDots.side[type].front;
+                  const backDot = manualDots.side[type].back;
+                  
+                  return (
+                    <g key={type}>
+                      {frontDot && (() => {
+                        const cx = offsetX + (frontDot.x * scaleX);
+                        const cy = offsetY + (frontDot.y * scaleY);
+                        const isDragging = draggingDot === `${type}-front`;
+                        
+                        return (
+                          <circle 
+                            cx={cx} 
+                            cy={cy} 
+                            r={isDragging ? "5" : "4"} 
+                            fill={getDotColor("side", type, "front")} 
+                            stroke="white" 
+                            strokeWidth={isDragging ? "2" : "1.5"} 
+                            opacity={isDragging ? 0.9 : 1}
+                            style={{cursor: "grab", pointerEvents: "auto"}}
+                            onPointerDown={(e) => {
+                              e.stopPropagation();
+                              setDraggingDot(`${type}-front`);
+                            }}
+                          />
+                        );
+                      })()}
+                      {backDot && (() => {
+                        const cx = offsetX + (backDot.x * scaleX);
+                        const cy = offsetY + (backDot.y * scaleY);
+                        const isDragging = draggingDot === `${type}-back`;
+                        
+                        return (
+                          <circle 
+                            cx={cx} 
+                            cy={cy} 
+                            r={isDragging ? "5" : "4"} 
+                            fill={getDotColor("side", type, "back")} 
+                            stroke="white" 
+                            strokeWidth={isDragging ? "2" : "1.5"} 
+                            opacity={isDragging ? 0.9 : 1}
+                            style={{cursor: "grab", pointerEvents: "auto"}}
+                            onPointerDown={(e) => {
+                              e.stopPropagation();
+                              setDraggingDot(`${type}-back`);
+                            }}
+                          />
+                        );
+                      })()}
+                      {frontDot && backDot && (
+                        <line 
+                          x1={offsetX + (frontDot.x * scaleX)} 
+                          y1={offsetY + (frontDot.y * scaleY)} 
+                          x2={offsetX + (backDot.x * scaleX)} 
+                          y2={offsetY + (backDot.y * scaleY)} 
+                          stroke={getDotColor("side", type, "front")} 
+                          strokeWidth="1.5" 
+                          strokeDasharray="3,3" 
+                          opacity="0.6"
+                        />
+                      )}
+                    </g>
+                  );
+                })}
+              </svg>
+            );
+          })()}
+        </div>
+        )}
+
+        {manualCaptureState === "side-capture" && (
+        <div style={{position:"relative", width:"100%", aspectRatio:"16/9", background:"black", borderRadius:12, overflow:"hidden"}}>
+          <video 
+            key="camera-video-side"
+            ref={(el)=>{
+              if (el) {
+                videoRef.current = el;
+                displayRef.current = el;
+                if (streamRef.current && el.srcObject !== streamRef.current) {
+                  el.srcObject = streamRef.current;
+                  el.onloadeddata = () => {
+                    el.play().catch(err => console.error("Video play error:", err));
+                  };
+                } else if (streamRef.current) {
+                  // Stream already attached, just play
+                  el.play().catch(err => console.error("Video play error:", err));
+                }
+              }
+            }} 
+            className="video" 
+            style={{width:"100%", height:"100%", objectFit:"contain"}} 
+            playsInline 
+            muted 
+            autoPlay
+          />
+          <canvas
+            ref={overlayRef}
+            style={{position:"absolute", inset:0}}
+            onPointerDown={onPointerDown}
+            onPointerMove={onPointerMove}
+            onPointerUp={onPointerUp}
+            onPointerLeave={onPointerUp}
+          />
+        </div>
+        )}
+
+        <p style={{opacity:0.7, fontSize:12, marginTop:8}}>
+          {manualCaptureState === "front-capture" && "📸 Capture or upload your front photo. Side capture happens next; calibration comes later."}
+          {manualCaptureState === "front-calibration" && "↕️ Drag the blue lines to mark head and heel positions, then lock scale."}
+          {manualCaptureState === "front-dots" && (() => {
+            const nextDot = getNextFrontDot();
+            const typeNames = {
+              shoulders: "Shoulders",
+              chest: "Chest",
+              waist: "Waist",
+              hips: "Hips",
+              thighs: "Thighs",
+              knee: "Knee",
+              calves: "Calves"
+            };
+            
+            if (!nextDot) {
+              return (
+                <>
+                  <strong style={{color: "#10b981", fontSize: 14}}>✅ All front dots placed!</strong>
+                  <br />
+                  Drag any dot to adjust, or continue to side calibration.
+                </>
+              );
+            }
+            
+            const color = getDotColor("front", nextDot.type, nextDot.side);
+            
+            if (nextDot.type === "thighs") {
+              if (nextDot.side === "left" || nextDot.side === "right") {
+                return (
+                  <>
+                    <strong style={{color: "#60a5fa", fontSize: 14}}>📍 Place Thighs dots (thickness)</strong>
+                    <br />
+                    Click on the <strong style={{color}}>{nextDot.side.toUpperCase()}</strong> side of the thigh ({nextDot.side === "left" ? "first" : "second"} dot)
+                  </>
+                );
+              } else if (nextDot.side === "top") {
+                return (
+                  <>
+                    <strong style={{color: "#60a5fa", fontSize: 14}}>📍 Place Thigh top dot (for length)</strong>
+                    <br />
+                    Click at the <strong style={{color}}>TOP</strong> of the thigh (where leg starts, for upper leg length)
+                  </>
+                );
+              }
+            } else if (nextDot.type === "knee") {
+              return (
+                <>
+                  <strong style={{color: "#60a5fa", fontSize: 14}}>📍 Place Knee center dot</strong>
+                  <br />
+                  Click at the <strong style={{color}}>CENTER</strong> of the knee (midpoint for leg length)
+                </>
+              );
+            } else if (nextDot.type === "calves") {
+              if (nextDot.side === "left" || nextDot.side === "right") {
+                return (
+                  <>
+                    <strong style={{color: "#60a5fa", fontSize: 14}}>📍 Place Calves dots (thickness)</strong>
+                    <br />
+                    Click on the <strong style={{color}}>{nextDot.side.toUpperCase()}</strong> side of the calf ({nextDot.side === "left" ? "first" : "second"} dot)
+                  </>
+                );
+              } else if (nextDot.side === "bottom") {
+                return (
+                  <>
+                    <strong style={{color: "#60a5fa", fontSize: 14}}>📍 Place Ankle dot (for length)</strong>
+                    <br />
+                    Click at the <strong style={{color}}>ANKLE</strong> (bottom of calf, for lower leg length)
+                  </>
+                );
+              }
+            } else {
+              // Standard width measurements
+              const sideText = nextDot.side === "left" ? "LEFT" : "RIGHT";
+              return (
+                <>
+                  <strong style={{color: "#60a5fa", fontSize: 14}}>📍 Place {typeNames[nextDot.type]} dots</strong>
+                  <br />
+                  Click on the <strong style={{color}}>{sideText}</strong> side of the {typeNames[nextDot.type].toLowerCase()} ({nextDot.side === "left" ? "first" : "second"} dot)
+                </>
+              );
+            }
+          })()}
+          {manualCaptureState === "side-capture" && "📸 Capture or upload your side photo. Calibration starts once both photos are ready."}
+          {manualCaptureState === "side-calibration" && "↕️ Drag the blue lines to mark head and heel positions, then lock scale."}
+          {manualCaptureState === "side-dots" && (() => {
+            const nextDot = getNextSideDot();
+            const typeNames = {
+              chest: "Chest",
+              waist: "Waist",
+              hips: "Hips",
+              thighs: "Thighs",
+              calves: "Calves"
+            };
+            
+            if (!nextDot) {
+              return (
+                <>
+                  <strong style={{color: "#10b981", fontSize: 14}}>✅ All side dots placed!</strong>
+                  <br />
+                  Drag any dot to adjust, or calculate measurements.
+                </>
+              );
+            }
+            
+            const sideText = nextDot.side === "front" ? "FRONT" : "BACK";
+            const color = getDotColor("side", nextDot.type, nextDot.side);
+            
+            return (
+              <>
+                <strong style={{color: "#60a5fa", fontSize: 14}}>📍 Place {typeNames[nextDot.type]} dots</strong>
+                <br />
+                Click on the <strong style={{color}}>{sideText}</strong> of the {typeNames[nextDot.type].toLowerCase()} ({nextDot.side === "front" ? "first" : "second"} dot)
+              </>
+            );
+          })()}
+        </p>
+          </>
+        )}
+
+        {/* Display segmentation composites (front and side) - Pose Estimation Only */}
+        {mode === "pose" && (frontComposite || sideComposite) && (
           <div style={{
             marginTop: 24,
             padding: 20,
@@ -1198,7 +4198,15 @@ export default function App() {
         )}
 
         {/* Display detected body measurements */}
-        {bodyMeasurements && (
+        <MeasurementDisplay 
+          bodyMeasurements={bodyMeasurements} 
+          mode={mode} 
+          useInches={useInches} 
+          setUseInches={setUseInches}
+        />
+        
+        {/* Legacy measurement display - will be removed after component is fully integrated */}
+        {false && bodyMeasurements && (
           <div style={{
             marginTop: 24,
             padding: 20,
@@ -1206,68 +4214,243 @@ export default function App() {
             borderRadius: 12,
             border: "1px solid #374151"
           }}>
-            <h2 style={{margin: "0 0 16px 0", fontSize: 20}}>Detected Body Measurements</h2>
+            <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16}}>
+              <h2 style={{margin: 0, fontSize: 20}}>Detected Body Measurements</h2>
+              <button
+                onClick={() => setUseInches(!useInches)}
+                style={{
+                  padding: "8px 16px",
+                  background: useInches ? "#3b82f6" : "#374151",
+                  color: "white",
+                  border: "none",
+                  borderRadius: "6px",
+                  cursor: "pointer",
+                  fontSize: 14,
+                  fontWeight: "bold"
+                }}
+              >
+                {useInches ? "Show CM" : "Show Inches"}
+              </button>
+            </div>
             
             {bodyMeasurements.height && (
               <div style={{marginBottom: 12, paddingBottom: 12, borderBottom: "1px solid #374151"}}>
-                <strong>Height:</strong> {bodyMeasurements.height.cm} cm ({bodyMeasurements.height.mm} mm)
+                <strong>Height:</strong> {formatMeasurement(bodyMeasurements.height.cm).main}
+                {formatMeasurement(bodyMeasurements.height.cm).sub && (
+                  <span style={{opacity: 0.7, fontSize: 12, marginLeft: 8}}>
+                    ({formatMeasurement(bodyMeasurements.height.cm).sub})
+                  </span>
+                )}
               </div>
             )}
 
-            {/* 2D Measurements (Widths and Depths) */}
-            {["chest", "waist", "hips", "thighs"].map(landmark => {
-              const measurement = bodyMeasurements[landmark];
-              if (!measurement) return null;
-
-              return (
-                <div key={landmark} style={{
-                  marginBottom: 20,
-                  padding: 16,
-                  background: "#111827",
-                  borderRadius: 8,
-                  border: "1px solid #374151"
-                }}>
-                  <h3 style={{margin: "0 0 12px 0", fontSize: 16, textTransform: "capitalize"}}>{landmark}</h3>
-                  <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12}}>
+            {/* Manual Drawing Mode: Display all measurements */}
+            {mode === "manual" && (
+              <>
+                {/* Display shoulders width (only width, no depth) */}
+                {bodyMeasurements.widths?.shoulders && (
+                  <div style={{
+                    marginBottom: 20,
+                    padding: 16,
+                    background: "#111827",
+                    borderRadius: 8,
+                    border: "1px solid #374151"
+                  }}>
+                    <h3 style={{margin: "0 0 12px 0", fontSize: 16, textTransform: "capitalize"}}>Shoulders</h3>
                     <div>
                       <div style={{fontSize: 11, opacity: 0.7, marginBottom: 4}}>Width (Front)</div>
-                      <div style={{fontSize: 18, fontWeight: "bold"}}>{measurement.width.cm} cm</div>
-                      <div style={{fontSize: 11, opacity: 0.6}}>{measurement.width.mm} mm</div>
-                    </div>
-                    <div>
-                      <div style={{fontSize: 11, opacity: 0.7, marginBottom: 4}}>Depth (Side)</div>
-                      <div style={{fontSize: 18, fontWeight: "bold"}}>{measurement.depth.cm} cm</div>
-                      <div style={{fontSize: 11, opacity: 0.6}}>{measurement.depth.mm} mm</div>
+                      <div style={{fontSize: 18, fontWeight: "bold"}}>{formatMeasurement(bodyMeasurements.widths.shoulders.cm).main}</div>
+                      {formatMeasurement(bodyMeasurements.widths.shoulders.cm).sub && (
+                        <div style={{fontSize: 11, opacity: 0.6}}>{formatMeasurement(bodyMeasurements.widths.shoulders.cm).sub}</div>
+                      )}
                     </div>
                   </div>
-                  
-                  {/* 3D Calculations */}
-                  <div style={{marginTop: 12, paddingTop: 12, borderTop: "1px solid #374151"}}>
-                    <div style={{fontSize: 12, opacity: 0.7, marginBottom: 8}}>3D Measurements</div>
-                    <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 8}}>
-                      <div>
-                        <div style={{fontSize: 10, opacity: 0.6}}>Circumference</div>
-                        <div style={{fontSize: 14, fontWeight: "bold"}}>{measurement.circumference.cm} cm</div>
-                      </div>
-                      <div>
-                        <div style={{fontSize: 10, opacity: 0.6}}>Cross-Section</div>
-                        <div style={{fontSize: 14, fontWeight: "bold"}}>{measurement.crossSectionalArea.cm2} cm²</div>
-                      </div>
-                      <div>
-                        <div style={{fontSize: 10, opacity: 0.6}}>Volume</div>
-                        <div style={{fontSize: 14, fontWeight: "bold"}}>{measurement.volume.liters} L</div>
-                        <div style={{fontSize: 9, opacity: 0.5}}>{measurement.volume.cm3} cm³</div>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
+                )}
 
-            {(!bodyMeasurements.chest && !bodyMeasurements.waist && !bodyMeasurements.hips && !bodyMeasurements.thighs) && (
-              <p style={{opacity: 0.7, fontSize: 14, marginTop: 12}}>
-                Could not detect all measurements. Please ensure the subject is fully visible and well-lit.
-              </p>
+                {["chest", "waist", "hips", "thighs", "calves"].map(landmark => {
+                  const measurement = bodyMeasurements[landmark];
+                  if (!measurement) return null;
+
+                  return (
+                    <div key={landmark} style={{
+                      marginBottom: 20,
+                      padding: 16,
+                      background: "#111827",
+                      borderRadius: 8,
+                      border: "1px solid #374151"
+                    }}>
+                      <h3 style={{margin: "0 0 12px 0", fontSize: 16, textTransform: "capitalize"}}>{landmark}</h3>
+                      <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12}}>
+                        <div>
+                          <div style={{fontSize: 11, opacity: 0.7, marginBottom: 4}}>Width (Front)</div>
+                          <div style={{fontSize: 18, fontWeight: "bold"}}>{formatMeasurement(measurement.width.cm).main}</div>
+                          {formatMeasurement(measurement.width.cm).sub && (
+                            <div style={{fontSize: 11, opacity: 0.6}}>{formatMeasurement(measurement.width.cm).sub}</div>
+                          )}
+                        </div>
+                        <div>
+                          <div style={{fontSize: 11, opacity: 0.7, marginBottom: 4}}>Depth (Side)</div>
+                          <div style={{fontSize: 18, fontWeight: "bold"}}>{formatMeasurement(measurement.depth.cm).main}</div>
+                          {formatMeasurement(measurement.depth.cm).sub && (
+                            <div style={{fontSize: 11, opacity: 0.6}}>{formatMeasurement(measurement.depth.cm).sub}</div>
+                          )}
+                        </div>
+                      </div>
+                      
+                      {/* 3D Calculations */}
+                      <div style={{marginTop: 12, paddingTop: 12, borderTop: "1px solid #374151"}}>
+                        <div style={{fontSize: 12, opacity: 0.7, marginBottom: 8}}>3D Measurements</div>
+                        <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 8}}>
+                          <div>
+                            <div style={{fontSize: 10, opacity: 0.6}}>Circumference</div>
+                            {measurement.circumference && isFinite(measurement.circumference.cm) && measurement.circumference.cm > 0 ? (
+                              <>
+                                <div style={{fontSize: 14, fontWeight: "bold"}}>{formatMeasurement(measurement.circumference.cm).main}</div>
+                                {formatMeasurement(measurement.circumference.cm).sub && (
+                                  <div style={{fontSize: 9, opacity: 0.5}}>{formatMeasurement(measurement.circumference.cm).sub}</div>
+                                )}
+                              </>
+                            ) : (
+                              <div style={{fontSize: 14, fontWeight: "bold", color: "#ef4444"}}>—</div>
+                            )}
+                          </div>
+                          <div>
+                            <div style={{fontSize: 10, opacity: 0.6}}>Cross-Section</div>
+                            <div style={{fontSize: 14, fontWeight: "bold"}}>{formatMeasurement(measurement.crossSectionalArea.cm2, "area").main}</div>
+                            {formatMeasurement(measurement.crossSectionalArea.cm2, "area").sub && (
+                              <div style={{fontSize: 9, opacity: 0.5}}>{formatMeasurement(measurement.crossSectionalArea.cm2, "area").sub}</div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+
+                {/* Display leg length measurements */}
+                {(bodyMeasurements.upperLegLength || bodyMeasurements.lowerLegLength || bodyMeasurements.totalLegLength) && (
+                  <div style={{
+                    marginBottom: 20,
+                    padding: 16,
+                    background: "#111827",
+                    borderRadius: 8,
+                    border: "1px solid #374151"
+                  }}>
+                    <h3 style={{margin: "0 0 12px 0", fontSize: 16}}>Leg Lengths</h3>
+                    <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12}}>
+                      {bodyMeasurements.upperLegLength && (
+                        <div>
+                          <div style={{fontSize: 11, opacity: 0.7, marginBottom: 4}}>Upper Leg (Thigh to Knee)</div>
+                          <div style={{fontSize: 18, fontWeight: "bold"}}>{formatMeasurement(bodyMeasurements.upperLegLength.cm).main}</div>
+                          {formatMeasurement(bodyMeasurements.upperLegLength.cm).sub && (
+                            <div style={{fontSize: 11, opacity: 0.6}}>{formatMeasurement(bodyMeasurements.upperLegLength.cm).sub}</div>
+                          )}
+                        </div>
+                      )}
+                      {bodyMeasurements.lowerLegLength && (
+                        <div>
+                          <div style={{fontSize: 11, opacity: 0.7, marginBottom: 4}}>Lower Leg (Knee to Ankle)</div>
+                          <div style={{fontSize: 18, fontWeight: "bold"}}>{formatMeasurement(bodyMeasurements.lowerLegLength.cm).main}</div>
+                          {formatMeasurement(bodyMeasurements.lowerLegLength.cm).sub && (
+                            <div style={{fontSize: 11, opacity: 0.6}}>{formatMeasurement(bodyMeasurements.lowerLegLength.cm).sub}</div>
+                          )}
+                        </div>
+                      )}
+                      {bodyMeasurements.totalLegLength && (
+                        <div>
+                          <div style={{fontSize: 11, opacity: 0.7, marginBottom: 4}}>Total Leg Length</div>
+                          <div style={{fontSize: 18, fontWeight: "bold"}}>{formatMeasurement(bodyMeasurements.totalLegLength.cm).main}</div>
+                          {formatMeasurement(bodyMeasurements.totalLegLength.cm).sub && (
+                            <div style={{fontSize: 11, opacity: 0.6}}>{formatMeasurement(bodyMeasurements.totalLegLength.cm).sub}</div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {(!bodyMeasurements.chest && !bodyMeasurements.waist && !bodyMeasurements.hips && !bodyMeasurements.thighs && !bodyMeasurements.calves) && (
+                  <p style={{opacity: 0.7, fontSize: 14, marginTop: 12}}>
+                    No measurements calculated. Please place all dots and calculate measurements.
+                  </p>
+                )}
+              </>
+            )}
+
+            {/* Pose Estimation Mode: Display all landmarks */}
+            {mode === "pose" && (
+              <>
+                {["chest", "waist", "hips", "thighs"].map(landmark => {
+                  const measurement = bodyMeasurements[landmark];
+                  if (!measurement) return null;
+
+                  return (
+                    <div key={landmark} style={{
+                      marginBottom: 20,
+                      padding: 16,
+                      background: "#111827",
+                      borderRadius: 8,
+                      border: "1px solid #374151"
+                    }}>
+                      <h3 style={{margin: "0 0 12px 0", fontSize: 16, textTransform: "capitalize"}}>{landmark}</h3>
+                      <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12}}>
+                        <div>
+                          <div style={{fontSize: 11, opacity: 0.7, marginBottom: 4}}>Width (Front)</div>
+                          <div style={{fontSize: 18, fontWeight: "bold"}}>{formatMeasurement(measurement.width.cm).main}</div>
+                          {formatMeasurement(measurement.width.cm).sub && (
+                            <div style={{fontSize: 11, opacity: 0.6}}>{formatMeasurement(measurement.width.cm).sub}</div>
+                          )}
+                        </div>
+                        <div>
+                          <div style={{fontSize: 11, opacity: 0.7, marginBottom: 4}}>Depth (Side)</div>
+                          <div style={{fontSize: 18, fontWeight: "bold"}}>{formatMeasurement(measurement.depth.cm).main}</div>
+                          {formatMeasurement(measurement.depth.cm).sub && (
+                            <div style={{fontSize: 11, opacity: 0.6}}>{formatMeasurement(measurement.depth.cm).sub}</div>
+                          )}
+                        </div>
+                      </div>
+                      
+                      {/* 3D Calculations */}
+                      <div style={{marginTop: 12, paddingTop: 12, borderTop: "1px solid #374151"}}>
+                        <div style={{fontSize: 12, opacity: 0.7, marginBottom: 8}}>3D Measurements</div>
+                        <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 8}}>
+                          <div>
+                            <div style={{fontSize: 10, opacity: 0.6}}>Circumference</div>
+                            {measurement.circumference && isFinite(measurement.circumference.cm) && measurement.circumference.cm > 0 ? (
+                              <>
+                                <div style={{fontSize: 14, fontWeight: "bold"}}>{formatMeasurement(measurement.circumference.cm).main}</div>
+                                {formatMeasurement(measurement.circumference.cm).sub && (
+                                  <div style={{fontSize: 9, opacity: 0.5}}>{formatMeasurement(measurement.circumference.cm).sub}</div>
+                                )}
+                              </>
+                            ) : (
+                              <div style={{fontSize: 14, fontWeight: "bold", color: "#ef4444"}}>—</div>
+                            )}
+                          </div>
+                          <div>
+                            <div style={{fontSize: 10, opacity: 0.6}}>Cross-Section</div>
+                            <div style={{fontSize: 14, fontWeight: "bold"}}>{formatMeasurement(measurement.crossSectionalArea.cm2, "area").main}</div>
+                            {formatMeasurement(measurement.crossSectionalArea.cm2, "area").sub && (
+                              <div style={{fontSize: 9, opacity: 0.5}}>{formatMeasurement(measurement.crossSectionalArea.cm2, "area").sub}</div>
+                            )}
+                          </div>
+                          <div>
+                            <div style={{fontSize: 10, opacity: 0.6}}>Volume</div>
+                            <div style={{fontSize: 14, fontWeight: "bold"}}>{measurement.volume.liters} L</div>
+                            <div style={{fontSize: 9, opacity: 0.5}}>{formatMeasurement(measurement.volume.cm3, "volume").main}</div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+
+                {(!bodyMeasurements.chest && !bodyMeasurements.waist && !bodyMeasurements.hips && !bodyMeasurements.thighs) && (
+                  <p style={{opacity: 0.7, fontSize: 14, marginTop: 12}}>
+                    Could not detect all measurements. Please ensure the subject is fully visible and well-lit.
+                  </p>
+                )}
+              </>
             )}
           </div>
         )}

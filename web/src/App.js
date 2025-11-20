@@ -75,6 +75,7 @@ export default function App() {
       chest: { left: null, right: null },
       waist: { left: null, right: null },
       hips: { left: null, right: null },
+      butt: { left: null, right: null }, // Butt width (left/right)
       // Thigh measurements: thickness (left/right) and upper leg length (top to knee)
       thighs: { left: null, right: null, top: null }, // left/right = thickness, top = top of thigh
       // Knee is the midpoint for leg length
@@ -86,6 +87,7 @@ export default function App() {
       chest: { front: null, back: null },
       waist: { front: null, back: null },
       hips: { front: null, back: null },
+      butt: { front: null, back: null }, // Butt depth (front/back)
       thighs: { front: null, back: null }, // Thigh depth/thickness
       calves: { front: null, back: null }  // Calf depth/thickness
     }
@@ -2503,7 +2505,7 @@ export default function App() {
     };
     
     // Calculate all front measurements (widths) - RAW
-    const frontTypes = ['shoulders', 'chest', 'waist', 'hips'];
+    const frontTypes = ['shoulders', 'chest', 'waist', 'hips', 'butt'];
     frontTypes.forEach(type => {
       const leftDot = manualDots.front[type].left;
       const rightDot = manualDots.front[type].right;
@@ -2544,7 +2546,7 @@ export default function App() {
     }
 
     // Calculate all side measurements (depths) - RAW (with co-registration)
-    const sideTypes = ['chest', 'waist', 'hips', 'thighs', 'calves'];
+    const sideTypes = ['chest', 'waist', 'hips', 'butt', 'thighs', 'calves'];
     sideTypes.forEach(type => {
       const frontDot = manualDots.side[type].front;
       const backDot = manualDots.side[type].back;
@@ -2684,7 +2686,7 @@ export default function App() {
       areasMm2: {}
     };
     
-    const all3DTypes = ['chest', 'waist', 'hips', 'thighs', 'calves'];
+    const all3DTypes = ['chest', 'waist', 'hips', 'butt', 'thighs', 'calves'];
     // Track co-registration stats
     const coRegStats = { total: 0, sumDeltaY: 0 };
     
@@ -2709,7 +2711,7 @@ export default function App() {
         const cFinal = result.circumference / 10; // cm
         const flags = finalizedMeasurements.flags?.[type] || {};
         const flagStr = flags.wdSuspicious ? 'wdSuspicious' : 'ok';
-        const r = type === 'shoulders' ? 0.30 : type === 'chest' ? 0.38 : type === 'waist' ? 0.46 : type === 'hips' ? 0.55 : 0.70;
+        const r = type === 'shoulders' ? 0.30 : type === 'chest' ? 0.38 : type === 'waist' ? 0.46 : type === 'hips' ? 0.55 : type === 'butt' ? 0.58 : 0.70;
         console.log(`[b] ${type} r=${r.toFixed(2)} Wraw=${(wRaw/10).toFixed(1)}mm Draw=${(dRaw/10).toFixed(1)}mm yaw=${rad2deg(yawFrontRad).toFixed(1)}° pitchS=${rad2deg(pitchSideRad).toFixed(1)}°`);
         console.log(` -> W=${(wFinal/10).toFixed(1)}mm D=${(dFinal/10).toFixed(1)}mm C=${cFinal.toFixed(1)}cm flags: ${flagStr}`);
         
@@ -2853,7 +2855,7 @@ export default function App() {
       // Also store widths and depths
       bodyMeasurementsObj.widths = {};
       bodyMeasurementsObj.depths = {};
-      ['shoulders', 'chest', 'waist', 'hips'].forEach(type => {
+      ['shoulders', 'chest', 'waist', 'hips', 'butt'].forEach(type => {
         if (measurements[`${type}Width`]) {
           bodyMeasurementsObj.widths[type] = measurements[`${type}Width`];
         }
@@ -2865,7 +2867,7 @@ export default function App() {
         bodyMeasurementsObj.widths.calves = measurements.calvesWidth;
       }
       
-      ['chest', 'waist', 'hips', 'thighs', 'calves'].forEach(type => {
+      ['chest', 'waist', 'hips', 'butt', 'thighs', 'calves'].forEach(type => {
         if (measurements[`${type}Depth`]) {
           bodyMeasurementsObj.depths[type] = measurements[`${type}Depth`];
         }
@@ -2942,6 +2944,7 @@ export default function App() {
           chest: 0.38,
           waist: 0.46,
           hips: 0.55,
+          butt: 0.58,
           thighs: 0.70,
           calves: 0.80
         }
@@ -2957,7 +2960,7 @@ export default function App() {
     };
 
     // Export dots
-    ['shoulders', 'chest', 'waist', 'hips', 'thighs', 'calves', 'knee'].forEach(type => {
+    ['shoulders', 'chest', 'waist', 'hips', 'butt', 'thighs', 'calves', 'knee'].forEach(type => {
       if (manualDots.front[type]) {
         Object.keys(manualDots.front[type]).forEach(side => {
           const dot = manualDots.front[type][side];
@@ -2972,7 +2975,7 @@ export default function App() {
       }
     });
 
-    ['chest', 'waist', 'hips', 'thighs', 'calves'].forEach(type => {
+    ['chest', 'waist', 'hips', 'butt', 'thighs', 'calves'].forEach(type => {
       if (manualDots.side[type]) {
         Object.keys(manualDots.side[type]).forEach(side => {
           const dot = manualDots.side[type][side];
@@ -2988,7 +2991,7 @@ export default function App() {
     });
 
     // Export measurements
-    ['shoulders', 'chest', 'waist', 'hips', 'thighs', 'calves'].forEach(type => {
+    ['shoulders', 'chest', 'waist', 'hips', 'butt', 'thighs', 'calves'].forEach(type => {
       const width = bodyMeasurements.widths?.[type];
       const depth = bodyMeasurements.depths?.[type];
       const threeD = bodyMeasurements[type];

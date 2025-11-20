@@ -2,7 +2,7 @@
 
 // Get next dot to place for front photo
 export const getNextFrontDot = (manualDots) => {
-  const widthOrder = ['shoulders', 'chest', 'waist', 'hips'];
+  const widthOrder = ['shoulders', 'chest', 'waist', 'hips', 'butt'];
   for (const type of widthOrder) {
     if (!manualDots.front[type].left) { return { type, side: 'left' }; }
     if (!manualDots.front[type].right) { return { type, side: 'right' }; }
@@ -19,7 +19,7 @@ export const getNextFrontDot = (manualDots) => {
 
 // Get next dot to place for side photo
 export const getNextSideDot = (manualDots) => {
-  const order = ['chest', 'waist', 'hips', 'thighs', 'calves'];
+  const order = ['chest', 'waist', 'hips', 'butt', 'thighs', 'calves'];
   for (const type of order) {
     if (!manualDots.side[type].front) { return { type, side: 'front' }; }
     if (!manualDots.side[type].back) { return { type, side: 'back' }; }
@@ -29,7 +29,7 @@ export const getNextSideDot = (manualDots) => {
 
 // Check if all front dots are placed
 export const areAllFrontDotsPlaced = (manualDots) => {
-  const widthComplete = ['shoulders', 'chest', 'waist', 'hips'].every(type => 
+  const widthComplete = ['shoulders', 'chest', 'waist', 'hips', 'butt'].every(type => 
     manualDots.front[type].left && manualDots.front[type].right
   );
   const thighsComplete = manualDots.front.thighs.left && manualDots.front.thighs.right && manualDots.front.thighs.top;
@@ -40,7 +40,7 @@ export const areAllFrontDotsPlaced = (manualDots) => {
 
 // Check if all side dots are placed
 export const areAllSideDotsPlaced = (manualDots) => {
-  return ['chest', 'waist', 'hips', 'thighs', 'calves'].every(type => 
+  return ['chest', 'waist', 'hips', 'butt', 'thighs', 'calves'].every(type => 
     manualDots.side[type].front && manualDots.side[type].back
   );
 };
@@ -53,6 +53,7 @@ export const getDotColor = (photoType, type, side) => {
       chest: { left: '#4ecdc4', right: '#44a08d' },
       waist: { left: '#3b82f6', right: '#ef4444' },
       hips: { left: '#9b59b6', right: '#8e44ad' },
+      butt: { left: '#ec4899', right: '#db2777' }, // Butt width (left/right)
       thighs: { left: '#f39c12', right: '#e67e22', top: '#f39c12' }, // Thickness (left/right) and length (top)
       knee: { center: '#e74c3c' }, // Knee center point
       calves: { left: '#1abc9c', right: '#16a085', bottom: '#1abc9c' } // left/right = thickness, bottom = ankle
@@ -61,6 +62,7 @@ export const getDotColor = (photoType, type, side) => {
       chest: { front: '#f59e0b', back: '#d97706' },
       waist: { front: '#f59e0b', back: '#8b5cf6' },
       hips: { front: '#10b981', back: '#059669' },
+      butt: { front: '#ec4899', back: '#db2777' }, // Butt depth (front/back)
       thighs: { front: '#f39c12', back: '#e67e22' }, // Thigh depth/thickness
       calves: { front: '#1abc9c', back: '#16a085' }  // Calf depth/thickness
     }

@@ -1,8 +1,8 @@
 {
-  "buildCommand": "cd web && npm install && npm run build",
-  "outputDirectory": "web/build",
-  "installCommand": "cd web && npm install",
-  "devCommand": "cd web && npm start",
+  "buildCommand": "npm run build",
+  "outputDirectory": "build",
+  "installCommand": "npm install",
+  "devCommand": "npm start",
   "framework": null,
   "rewrites": [
     {

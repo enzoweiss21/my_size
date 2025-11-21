@@ -64,7 +64,7 @@ export default function MeasurementDisplay({ bodyMeasurements, mode, useInches, 
             </div>
           )}
 
-          {["chest", "waist", "hips", "thighs", "calves"].map(landmark => {
+          {["chest", "waist", "hips", "butt", "thighs", "calves"].map(landmark => {
             const measurement = bodyMeasurements[landmark];
             if (!measurement) return null;
 

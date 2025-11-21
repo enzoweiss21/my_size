@@ -366,7 +366,7 @@ export default function App() {
         
         if (manualCaptureState === "front-dots") {
           // Standard width measurements (left/right)
-          const widthTypes = ['shoulders', 'chest', 'waist', 'hips'];
+          const widthTypes = ['shoulders', 'chest', 'waist', 'hips', 'butt'];
           for (const type of widthTypes) {
             if (manualDots.front[type].left) {
               const dist = Math.sqrt(Math.pow(clickX - manualDots.front[type].left.x, 2) + Math.pow(clickY - manualDots.front[type].left.y, 2));
@@ -439,7 +439,7 @@ export default function App() {
             }
           }
         } else if (manualCaptureState === "side-dots") {
-          const types = ['chest', 'waist', 'hips', 'thighs', 'calves'];
+          const types = ['chest', 'waist', 'hips', 'butt', 'thighs', 'calves'];
           for (const type of types) {
             if (manualDots.side[type].front) {
               const dist = Math.sqrt(Math.pow(clickX - manualDots.side[type].front.x, 2) + Math.pow(clickY - manualDots.side[type].front.y, 2));
@@ -2825,7 +2825,7 @@ export default function App() {
     if (measurements && Object.keys(measurements).length > 0) {
       // Store all 3D measurements
       const bodyMeasurementsObj = {};
-      ['chest', 'waist', 'hips', 'thighs', 'calves'].forEach(type => {
+      ['chest', 'waist', 'hips', 'butt', 'thighs', 'calves'].forEach(type => {
         if (measurements[`${type}3D`]) {
           bodyMeasurementsObj[type] = measurements[`${type}3D`];
         }
@@ -3603,7 +3603,7 @@ export default function App() {
               position:"absolute", 
               inset:0, 
               zIndex:1,
-              pointerEvents: (mode === "manual" && (manualCaptureState === "front-dots" || manualCaptureState === "side-dots")) ? "none" : "auto"
+              pointerEvents: (mode === "manual" && (manualCaptureState === "front-dots" || manualCaptureState === "side-dots") && !draggingDot) ? "none" : "auto"
             }}
             onPointerDown={onPointerDown}
             onPointerMove={onPointerMove}
@@ -3627,7 +3627,7 @@ export default function App() {
             
             // Check if any dots are placed
             const hasAnyDots = 
-              ['shoulders', 'chest', 'waist', 'hips'].some(type => 
+              ['shoulders', 'chest', 'waist', 'hips', 'butt'].some(type => 
                 manualDots.front[type].left || manualDots.front[type].right
               ) ||
               manualDots.front.thighs.left || manualDots.front.thighs.right || manualDots.front.thighs.top ||
@@ -3637,9 +3637,21 @@ export default function App() {
             if (!hasAnyDots) return null;
             
             return (
-              <svg style={{position:"absolute", inset:0, pointerEvents:"none", zIndex:2, width:"100%", height:"100%"}}>
-                {/* Standard width measurements (shoulders, chest, waist, hips) */}
-                {['shoulders', 'chest', 'waist', 'hips'].map(type => {
+              <svg 
+                style={{
+                  position:"absolute", 
+                  inset:0, 
+                  pointerEvents: draggingDot ? "auto" : "none", 
+                  zIndex:2, 
+                  width:"100%", 
+                  height:"100%"
+                }}
+                onPointerMove={draggingDot ? onPointerMove : undefined}
+                onPointerUp={draggingDot ? onPointerUp : undefined}
+                onPointerLeave={draggingDot ? onPointerUp : undefined}
+              >
+                {/* Standard width measurements (shoulders, chest, waist, hips, butt) */}
+                {['shoulders', 'chest', 'waist', 'hips', 'butt'].map(type => {
                   const leftDot = manualDots.front[type].left;
                   const rightDot = manualDots.front[type].right;
                   
@@ -3908,15 +3920,27 @@ export default function App() {
             const offsetX = (containerRect.width - imgRect.width) / 2;
             const offsetY = (containerRect.height - imgRect.height) / 2;
             
-            const hasAnyDots = ['chest', 'waist', 'hips', 'thighs', 'calves'].some(type => 
+            const hasAnyDots = ['chest', 'waist', 'hips', 'butt', 'thighs', 'calves'].some(type => 
               manualDots.side[type].front || manualDots.side[type].back
             );
             
             if (!hasAnyDots) return null;
             
             return (
-              <svg style={{position:"absolute", inset:0, pointerEvents:"none", zIndex:2, width:"100%", height:"100%"}}>
-                {['chest', 'waist', 'hips', 'thighs', 'calves'].map(type => {
+              <svg 
+                style={{
+                  position:"absolute", 
+                  inset:0, 
+                  pointerEvents: draggingDot ? "auto" : "none", 
+                  zIndex:2, 
+                  width:"100%", 
+                  height:"100%"
+                }}
+                onPointerMove={draggingDot ? onPointerMove : undefined}
+                onPointerUp={draggingDot ? onPointerUp : undefined}
+                onPointerLeave={draggingDot ? onPointerUp : undefined}
+              >
+                {['chest', 'waist', 'hips', 'butt', 'thighs', 'calves'].map(type => {
                   const frontDot = manualDots.side[type].front;
                   const backDot = manualDots.side[type].back;
                   

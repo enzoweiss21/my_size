@@ -2111,10 +2111,6 @@ export default function App() {
   };
 
   // ===== UNIT HELPERS (avoid stealth unit slips) =====
-  const mm = (px, mmPerPx) => px * mmPerPx;
-  const cm = (mm) => mm / 10;
-  const inches = (mm) => mm / 25.4;
-  
   // Helper: Convert cm to inches (1 cm = 0.393701 inches)
   const cmToInches = (cm) => {
     return Math.round((cm * 0.393701) * 10) / 10;
@@ -2256,6 +2252,8 @@ export default function App() {
   };
   
   // Frame burst median: capture multiple frames and use median for stability
+  // (Currently unused - kept for future implementation)
+  // eslint-disable-next-line no-unused-vars
   const captureBurstMedian = async (count = 3) => {
     const frames = [];
     for (let i = 0; i < count; i++) {
@@ -2294,9 +2292,7 @@ export default function App() {
       const c = Math.cos(t);
       const s1 = Math.sin(t);
       
-      const ac = aMm * Math.sign(c) * Math.pow(Math.abs(c), 2 / n);
-      const bs = bMm * Math.sign(s1) * Math.pow(Math.abs(s1), 2 / n);
-      
+      // Calculate derivatives for speed computation
       const dac = aMm * (2 / n) * Math.pow(Math.abs(c), 2 / n - 1) * (-Math.sin(t));
       const dbs = bMm * (2 / n) * Math.pow(Math.abs(s1), 2 / n - 1) * Math.cos(t);
       
@@ -2366,10 +2362,7 @@ export default function App() {
   };
   
   // ===== CO-REGISTRATION HELPERS =====
-  // Get Y position at same physical height ratio from head
-  const rowAtRatio = (headY, heelY, r) => {
-    return headY + r * (heelY - headY); // r = 0..1 from head
-  };
+  // rowAtRatio is now imported from calibrationUtils
 
   // Helper: Format measurement display based on unit preference
   const formatMeasurement = (cmValue, unit = "length") => {
@@ -2548,8 +2541,8 @@ export default function App() {
     // Calculate all side measurements (depths) - RAW (with co-registration)
     const sideTypes = ['chest', 'waist', 'hips', 'butt', 'thighs', 'calves'];
     sideTypes.forEach(type => {
-      const frontDot = manualDots.side[type].front;
-      const backDot = manualDots.side[type].back;
+      let frontDot = manualDots.side[type].front;
+      let backDot = manualDots.side[type].back;
       console.log(`[${type} depth] Front dot:`, frontDot, "Back dot:", backDot);
       
       // Co-registration: find corresponding front width Y position
@@ -2614,7 +2607,7 @@ export default function App() {
     
     // Update measurements with corrected values (with validation)
     Object.keys(correctedMeasurements.frontWidthsMm).forEach(type => {
-      const correctedMm = correctedMeasurements.frontWidthsMm[type];
+      let correctedMm = correctedMeasurements.frontWidthsMm[type];
       
       // Validate corrected value
       if (!isFinite(correctedMm) || correctedMm <= 0) {
@@ -2687,8 +2680,6 @@ export default function App() {
     };
     
     const all3DTypes = ['chest', 'waist', 'hips', 'butt', 'thighs', 'calves'];
-    // Track co-registration stats
-    const coRegStats = { total: 0, sumDeltaY: 0 };
     
     all3DTypes.forEach(type => {
       const result = finalizeBand(finalizedMeasurements, type);
@@ -2896,6 +2887,7 @@ export default function App() {
   };
 
   // Export measurements with enhanced schema (includes angles, flags, co-registration ratios)
+  // eslint-disable-next-line no-unused-vars
   const exportMeasurements = () => {
     if (!bodyMeasurements) {
       alert("No measurements to export. Please calculate measurements first.");
@@ -3593,7 +3585,7 @@ export default function App() {
             <img 
               ref={displayRef} 
               src={frontImageData || capturedDataUrl} 
-              alt="Front Photo" 
+              alt="Front" 
               style={{width:"100%", height:"100%", objectFit:"contain", cursor: manualCaptureState === "front-dots" ? (draggingDot ? "grabbing" : "crosshair") : "default"}}
               onClick={(e) => manualCaptureState === "front-dots" && !draggingDot && handleManualImageClick(e, "front")}
             />
@@ -3601,7 +3593,7 @@ export default function App() {
             <img 
               ref={displayRef} 
               src={sideImageData || capturedDataUrl} 
-              alt="Side Photo" 
+              alt="Side" 
               style={{width:"100%", height:"100%", objectFit:"contain", cursor: manualCaptureState === "side-dots" ? (draggingDot ? "grabbing" : "crosshair") : "default"}}
               onClick={(e) => manualCaptureState === "side-dots" && !draggingDot && handleManualImageClick(e, "side")}
             />
@@ -4042,6 +4034,7 @@ export default function App() {
               chest: "Chest",
               waist: "Waist",
               hips: "Hips",
+              butt: "Butt",
               thighs: "Thighs",
               knee: "Knee",
               calves: "Calves"
@@ -4123,6 +4116,7 @@ export default function App() {
               chest: "Chest",
               waist: "Waist",
               hips: "Hips",
+              butt: "Butt",
               thighs: "Thighs",
               calves: "Calves"
             };

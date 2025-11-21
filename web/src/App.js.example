@@ -1,0 +1,74 @@
+// This is what App.js SHOULD look like after full refactoring
+// (Currently it's ~4200 lines, but this is the goal)
+
+import React, { useState } from "react";
+import ModeSelector from "./components/ModeSelector";
+import PoseEstimationMode from "./components/PoseEstimationMode";
+import ManualDrawingMode from "./components/ManualDrawingMode";
+import { useCamera } from "./hooks/useCamera";
+import { useMediaPipe } from "./hooks/useMediaPipe";
+import { useDeviceOrientation } from "./hooks/useDeviceOrientation";
+
+export default function App() {
+  const [mode, setMode] = useState("select");
+
+  // Shared hooks
+  const { videoRef, streamRef } = useCamera();
+  const { segRef, poseRef, isModelReady, isPoseReady } = useMediaPipe();
+  const { pitchDeg, rollDeg } = useDeviceOrientation();
+
+  // Mode selection screen
+  if (mode === "select") {
+    return <ModeSelector onSelectMode={setMode} />;
+  }
+
+  // Main app with back button
+  return (
+    <div style={{background:"#0b1220", color:"#e5e7eb", minHeight:"100vh"}}>
+      <div style={{maxWidth:960, margin:"0 auto", padding:16}}>
+        <button
+          onClick={() => setMode("select")}
+          style={{
+            marginBottom: 16,
+            padding: "8px 16px",
+            background: "#374151",
+            color: "#e5e7eb",
+            border: "1px solid #4B5563",
+            borderRadius: 6,
+            cursor: "pointer"
+          }}
+        >
+          ← Back to Menu
+        </button>
+
+        {mode === "pose" && (
+          <PoseEstimationMode
+            videoRef={videoRef}
+            streamRef={streamRef}
+            segRef={segRef}
+            poseRef={poseRef}
+            isModelReady={isModelReady}
+            isPoseReady={isPoseReady}
+            pitchDeg={pitchDeg}
+            rollDeg={rollDeg}
+          />
+        )}
+
+        {mode === "manual" && (
+          <ManualDrawingMode
+            videoRef={videoRef}
+            streamRef={streamRef}
+            segRef={segRef}
+            poseRef={poseRef}
+            isModelReady={isModelReady}
+            isPoseReady={isPoseReady}
+            pitchDeg={pitchDeg}
+            rollDeg={rollDeg}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+

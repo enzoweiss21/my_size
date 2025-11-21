@@ -22,9 +22,7 @@ export const superellipsePerimeter = (aMm, bMm, n = 3.2) => {
     const c = Math.cos(t);
     const s1 = Math.sin(t);
     
-    const ac = aMm * Math.sign(c) * Math.pow(Math.abs(c), 2 / n);
-    const bs = bMm * Math.sign(s1) * Math.pow(Math.abs(s1), 2 / n);
-    
+    // Calculate derivatives for speed computation
     const dac = aMm * (2 / n) * Math.pow(Math.abs(c), 2 / n - 1) * (-Math.sin(t));
     const dbs = bMm * (2 / n) * Math.pow(Math.abs(s1), 2 / n - 1) * Math.cos(t);
     

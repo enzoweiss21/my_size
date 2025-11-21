@@ -1,4 +1,4 @@
-import { clamp, deg2rad } from './angleUtils';
+import { clamp } from './angleUtils';
 
 // Expand by cos with tighter caps and prevent shrinkage from rounding errors
 export const expandByCos = (raw, cosVal, cap = 1.12) => {

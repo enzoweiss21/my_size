@@ -4,7 +4,7 @@ import MeasurementDisplay from "./components/MeasurementDisplay";
 import { useCamera } from "./hooks/useCamera";
 import { useMediaPipe } from "./hooks/useMediaPipe";
 import { useDeviceOrientation } from "./hooks/useDeviceOrientation";
-import { formatMeasurement as formatMeasurementUtil } from "./utils/formatUtils";
+import { formatMeasurement } from "./utils/formatUtils";
 import { 
   getNextFrontDot as getNextFrontDotUtil, 
   getNextSideDot as getNextSideDotUtil, 
@@ -12,7 +12,7 @@ import {
   areAllSideDotsPlaced as areAllSideDotsPlacedUtil, 
   getDotColor as getDotColorUtil 
 } from "./utils/manualDrawingUtils";
-import { estimatePitchFromPose, estimateYawFromPose, estimateYawFromPoseStable, rad2deg, smoothAngle, deg2rad } from "./utils/angleUtils";
+import { estimateYawFromPoseStable, smoothAngle, deg2rad, rad2deg } from "./utils/angleUtils";
 import { correctForeshortening } from "./utils/foreshorteningUtils";
 import { refineEdgeY, coRegisterY, snapPairToY } from "./utils/calibrationUtils";
 import { circumferenceMm } from "./utils/circumferenceUtils";
@@ -92,6 +92,7 @@ export default function App() {
       calves: { front: null, back: null }  // Calf depth/thickness
     }
   });
+  // eslint-disable-next-line no-unused-vars
   const [activeDotType, setActiveDotType] = useState(null); // Tracks which measurement type we're placing
   const [draggingDot, setDraggingDot] = useState(null); // e.g. "shoulders-left" | "chest-right" | null
   const [manualCaptureState, setManualCaptureState] = useState("front-capture"); // "front-capture" | "front-calibration" | "side-capture" | "side-calibration" | "front-dots" | "side-dots"
@@ -109,6 +110,7 @@ export default function App() {
   
   // Pose data for tilt corrections
   const [frontPose, setFrontPose] = useState(null); // MediaPipe pose landmarks from front photo
+  // eslint-disable-next-line no-unused-vars
   const [sidePose, setSidePose] = useState(null); // MediaPipe pose landmarks from side photo
   const [frontPitch, setFrontPitch] = useState(0); // Pitch angle from front photo (radians)
   const [sidePitch, setSidePitch] = useState(0); // Pitch angle from side photo (radians)
@@ -233,7 +235,7 @@ export default function App() {
       
       return () => clearTimeout(timeout);
     }
-  }, [mode, manualCaptureState]);
+  }, [mode, manualCaptureState, streamRef, videoRef]);
 
   // ---- draw overlay (lines + level bubble + scale readout) ----
   useEffect(() => {
@@ -706,7 +708,7 @@ export default function App() {
       if (manualCaptureState === "front-calibration") {
         const canvas = capturedCanvasRef.current;
         // Detect pose and estimate pitch/yaw for corrections
-        const { pitchRad, yawRad, poseResult } = await detectPoseAndEstimatePitch(canvas, "front");
+        const { pitchRad, poseResult } = await detectPoseAndEstimatePitch(canvas, "front");
         setFrontPitch(pitchRad);
           // Use smoother yaw estimate with angle sanity bounds
           const rawYaw = estimateYawFromPose(poseResult);
@@ -1619,11 +1621,11 @@ export default function App() {
 
     // Sanity constraints based on height
     // Width (front photo): side-to-side breadth is larger
-    const minWidthCm = bodyHeightCm * 0.25; // 25% of height
-    const maxWidthCm = bodyHeightCm * 0.50; // 50% of height (reduced from 55%)
-    // Depth (side photo): front-to-back thickness is naturally smaller
-    const minDepthCm = bodyHeightCm * 0.18; // 18% of height (restored for better validation)
-    const maxDepthCm = bodyHeightCm * 0.45; // 45% of height (reduced from 50%)
+    // Sanity constraints based on height (commented out - used in landmark-specific bounds below)
+    // const minWidthCm = bodyHeightCm * 0.25; // 25% of height
+    // const maxWidthCm = bodyHeightCm * 0.50; // 50% of height (reduced from 55%)
+    // const minDepthCm = bodyHeightCm * 0.18; // 18% of height (restored for better validation)
+    // const maxDepthCm = bodyHeightCm * 0.45; // 45% of height (reduced from 50%)
 
     // Define key vertical positions as ratios from HEAD (0.0 = head, 1.0 = heel)
     // All ratios are from HEAD to ensure correct ordering: chest < waist < hips < thighs
@@ -1743,7 +1745,7 @@ export default function App() {
           chosenRegion = result.details;
           
           // Enhanced debug logs
-          const widthSamples = []; // Would need to collect from measureWidthWithRetune
+          // const widthSamples = []; // Would need to collect from measureWidthWithRetune (unused)
           console.log(`[width] ${name}: p10=${dimPx.toFixed(1)}px, kernel=${usedKernel}px`);
           if (chosenRegion) {
             console.log(`[asym] ${name}: L=${chosenRegion.leftX - torsoROI.minX}px, R=${torsoROI.maxX - chosenRegion.rightX}px`);
@@ -1791,7 +1793,7 @@ export default function App() {
       
       // Symmetry clamp for width (apply BEFORE bounds check)
       if (type === "width" && chosenRegion) {
-        const torsoCenterX = (torsoROI.minX + torsoROI.maxX) / 2;
+        // const torsoCenterX = (torsoROI.minX + torsoROI.maxX) / 2; // Unused
         const leftHalf = chosenRegion.leftX - torsoROI.minX;
         const rightHalf = torsoROI.maxX - chosenRegion.rightX;
         const asymmetry = Math.abs(leftHalf - rightHalf) / dimPx;

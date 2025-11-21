@@ -4,7 +4,6 @@ import MeasurementDisplay from "./components/MeasurementDisplay";
 import { useCamera } from "./hooks/useCamera";
 import { useMediaPipe } from "./hooks/useMediaPipe";
 import { useDeviceOrientation } from "./hooks/useDeviceOrientation";
-import { formatMeasurement } from "./utils/formatUtils";
 import { 
   getNextFrontDot as getNextFrontDotUtil, 
   getNextSideDot as getNextSideDotUtil, 
@@ -12,10 +11,8 @@ import {
   areAllSideDotsPlaced as areAllSideDotsPlacedUtil, 
   getDotColor as getDotColorUtil 
 } from "./utils/manualDrawingUtils";
-import { estimateYawFromPoseStable, smoothAngle, deg2rad, rad2deg } from "./utils/angleUtils";
-import { correctForeshortening } from "./utils/foreshorteningUtils";
-import { refineEdgeY, coRegisterY, snapPairToY } from "./utils/calibrationUtils";
-import { circumferenceMm } from "./utils/circumferenceUtils";
+import { estimateYawFromPoseStable, smoothAngle } from "./utils/angleUtils";
+import { coRegisterY, snapPairToY } from "./utils/calibrationUtils";
 import { finalizeBand } from "./utils/measurementUtils";
 
 // Feature flags
